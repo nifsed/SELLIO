@@ -1,9 +1,9 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import Sellio from './Sellio.jsx'
+import Nolkoma from './Nolkoma.jsx'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <Sellio />
+    <Nolkoma />
   </React.StrictMode>
 )
