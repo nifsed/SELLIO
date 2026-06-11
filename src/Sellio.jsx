@@ -810,10 +810,12 @@ function parseTikTokIncomeXlsx(buf) {
     komisiDinamis:  -komisiDinamis,
     biayaProses:    -biayaProses,
     totalDilepas, adSpend,
-    refundOrderCount: refundOrders.length,
+    refundOrderCount: hasLaporan ? null : refundOrders.length,
     refundValue,
-    totalOrderCount: orders.length,
-    refundRateOrder: orders.length ? (refundOrders.length / orders.length) * 100 : 0,
+    // When using Laporan, order count from Detail pesanan is incomplete (only released orders)
+    // Don't show order-based refund rate — only value-based rate is accurate
+    totalOrderCount: hasLaporan ? null : orders.length,
+    refundRateOrder: hasLaporan ? null : (orders.length ? (refundOrders.length / orders.length) * 100 : 0),
     refundRateValue: gmvBruto ? (refundValue / gmvBruto) * 100 : 0,
     totalFee:       -totalBiayaRaw,
     feeRateNetGmv:  netGmv   ? totalBiayaRaw / netGmv   * 100 : 0,
@@ -4102,7 +4104,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
         <FeeKpi label="Total Dilepas ke Saldo" value={rpShort(ds?.totalDilepas || 0)} color={C.good} sub={"masuk saldo penjual"} />
         <FeeKpi label="Fee Rate vs Harga Asli" value={(ds?.feeRateGross || 0).toFixed(1)+"%"} color={C.watch} />
         <FeeKpi label="Take Rate Total" value={(ds?.takeRate || 0).toFixed(1)+"%"} color={C.watch} sub={"% Net GMV yg tidak masuk saldo"} />
-        {snap?.orders && <FeeKpi label="Jumlah Pesanan" value={snap.orders.length.toLocaleString("id-ID")} color={C.muted} sub={(snap.periodStart||"") + " → " + (snap.periodEnd||"")} />}
+        {snap?.orders && <FeeKpi label="Jumlah Pesanan" value={snap.orders.length.toLocaleString("id-ID")} color={C.muted} sub={ds?.dataSource === "laporan" ? "data tidak lengkap — hanya pesanan yang dilepas di periode ini" : (snap.periodStart||"") + " → " + (snap.periodEnd||"")} />}
         {ds?.totalOrderCount > 0 && <FeeKpi
           label="Retur / Refund (order)"
           value={(ds.refundRateOrder || 0).toFixed(1) + "%"}
