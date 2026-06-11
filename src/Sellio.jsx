@@ -217,6 +217,7 @@ function parseProductXlsx(arrayBuffer) {
   if (!rows.length) throw new Error("Sheet kosong.");
   const header = rows[0].map((h) => String(h).trim());
   const col = (name) => header.indexOf(name);
+  const dataStart = 1;
   const idx = {
     code: col("Kode Produk"),
     name: col("Produk"),
