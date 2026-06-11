@@ -689,10 +689,8 @@ function parseTikTokIncomeXlsx(buf) {
   const sh = wb.Sheets["Detail pesanan"];
   if (!sh) throw new Error("Sheet 'Detail pesanan' tidak ditemukan — pastikan file TikTok Shop yang benar.");
 
-  // Use cell-by-cell reader to handle string-typed numeric cells and sparse columns
-  // TikTok stores numbers as strings (data_type=s), sheet_to_json may misread these
   function readSheetRows(sheet) {
-    const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:CB500");
+    const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:CB1000");
     const out = [];
     for (let R = range.s.r; R <= range.e.r; R++) {
       const row = [];
@@ -705,12 +703,6 @@ function parseTikTokIncomeXlsx(buf) {
     }
     return out;
   }
-  const rows = readSheetRows(sh);
-  if (!rows.length) throw new Error("File kosong.");
-
-  // Row 0 = headers
-  const hdrs = rows[0].map(c => String(c ?? "").trim());
-  const col = (name) => hdrs.indexOf(name);
 
   const n = (v) => {
     if (v === null || v === undefined || v === "") return 0;
@@ -720,18 +712,47 @@ function parseTikTokIncomeXlsx(buf) {
     return isNaN(x) ? 0 : x;
   };
 
-  // Separate orders vs ad payments
-  const orders = [], adPayments = [];
+  // ── 1. Read Laporan sheet for authoritative summary ──
+  let laporan = {};
   let periodStart = "", periodEnd = "";
+  const lsh = wb.Sheets["Laporan"];
+  if (lsh) {
+    const lrows = readSheetRows(lsh);
+    lrows.forEach(row => {
+      const label = String(row[0] || "").trim();
+      const label2 = String(row[1] || "").trim();
+      const val1 = n(row[1]);
+      const val2 = n(row[2]);
+      if (label) laporan[label] = val1 || val2;
+      if (label2 && label2 !== label) laporan[label2] = val2 || val1;
+    });
+    // Parse period
+    const periodeRow = lrows.find(r => String(r[0]).trim() === "Periode");
+    if (periodeRow) {
+      const parts = String(periodeRow[1] || "").split("-");
+      if (parts.length === 2) {
+        periodStart = parts[0].trim().replace(/\//g, "-");
+        periodEnd   = parts[1].trim().replace(/\//g, "-");
+      }
+    }
+  }
+
+  // ── 2. Read Detail pesanan for per-order breakdown ──
+  const rows = readSheetRows(sh);
+  if (!rows.length) throw new Error("File kosong.");
+  const hdrs = rows[0].map(c => String(c ?? "").trim());
+  const col = (name) => hdrs.indexOf(name);
+
+  const orders = [], adPayments = [];
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r[col("ID Pesanan/Penyesuaian")]) continue;
     const jenis = String(r[col("Jenis transaksi")] || "").trim();
     const tgl = String(r[col("Waktu pemesanan")] || "").slice(0, 10);
-    if (tgl) {
+    if (tgl && !periodStart) {
       if (!periodStart || tgl < periodStart) periodStart = tgl;
-      if (!periodEnd || tgl > periodEnd) periodEnd = tgl;
+      if (!periodEnd   || tgl > periodEnd)   periodEnd   = tgl;
     }
     if (jenis === "Pesanan") {
       orders.push({
@@ -753,55 +774,64 @@ function parseTikTokIncomeXlsx(buf) {
         sumberPesanan:  String(r[col("Sumber pesanan")] || "TikTok Shop").trim() || "TikTok Shop",
       });
     } else if (jenis === "Pembayaran GMV untuk Iklan TikTok") {
-      adPayments.push(n(r[col("Jumlah penyelesaian pembayaran")]));
+      adPayments.push(Math.abs(n(r[col("Jumlah penyelesaian pembayaran")])));
     }
   }
 
-  // Aggregate summary
-  const gmvBruto       = orders.reduce((t,o) => t + o.subtotalBruto, 0);
-  const diskonPenjual  = orders.reduce((t,o) => t + o.diskonPenjual, 0);
-  const netGmv         = gmvBruto + diskonPenjual;
-  const totalBiaya     = orders.reduce((t,o) => t + o.totalBiaya, 0);
-  const komisiPlatform = orders.reduce((t,o) => t + o.komisiPlatform, 0);
-  const komisiAfiliasi = orders.reduce((t,o) => t + o.komisiAfiliasi, 0);
-  const komisiDinamis  = orders.reduce((t,o) => t + o.komisiDinamis, 0);
-  const biayaProses    = orders.reduce((t,o) => t + o.biayaProses, 0);
-  const totalDilepas   = orders.reduce((t,o) => t + o.settlement, 0);
+  // ── 3. Use Laporan as authoritative, per-order as fallback ──
+  const hasLaporan = laporan["Subtotal sebelum diskon"] > 0;
+
+  const gmvBruto       = hasLaporan ? laporan["Subtotal sebelum diskon"]         : orders.reduce((t,o) => t + o.subtotalBruto, 0);
+  const diskonPenjual  = hasLaporan ? laporan["Diskon penjual"]                  : orders.reduce((t,o) => t + o.diskonPenjual, 0);
+  const netGmv         = hasLaporan ? laporan["Subtotal setelah diskon penjual"] : gmvBruto + diskonPenjual;
+  const totalBiayaRaw  = hasLaporan ? Math.abs(laporan["Total Biaya"])           : Math.abs(orders.reduce((t,o) => t + o.totalBiaya, 0));
+  const komisiPlatform = hasLaporan ? Math.abs(laporan["Biaya komisi platform"]) : Math.abs(orders.reduce((t,o) => t + o.komisiPlatform, 0));
+  const komisiAfiliasi = hasLaporan ? Math.abs(laporan["Komisi Afiliasi"] || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiAfiliasi, 0));
+  const komisiDinamis  = hasLaporan ? Math.abs(laporan["Komisi dinamis"]  || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiDinamis, 0));
+  const biayaProses    = hasLaporan ? Math.abs(laporan["Biaya pemrosesan pesanan"] || 0) : Math.abs(orders.reduce((t,o) => t + o.biayaProses, 0));
+  const totalDilepas   = hasLaporan ? laporan["Jumlah penyelesaian pembayaran"]  : orders.reduce((t,o) => t + o.settlement, 0);
   const adSpend        = adPayments.reduce((t,v) => t + v, 0);
 
-  // Refund metrics: orders where subtotalRefund < 0 = pengembalian
+  // Refund
+  const refundValue    = hasLaporan
+    ? Math.abs(laporan["Subtotal pengembalian dana sebelum diskon penjual"] || 0)
+    : orders.filter(o => o.subtotalRefund < 0).reduce((t,o) => t + Math.abs(o.subtotalRefund), 0);
   const refundOrders   = orders.filter(o => o.subtotalRefund < 0);
-  const refundValue    = refundOrders.reduce((t,o) => t + Math.abs(o.subtotalRefund), 0);
 
   const summary = {
     channel: "tiktok",
-    gmvBruto, diskonPenjual, netGmv, totalBiaya,
-    komisiPlatform, komisiAfiliasi, komisiDinamis, biayaProses,
+    gmvBruto,
+    diskonPenjual: -Math.abs(diskonPenjual),
+    netGmv,
+    totalBiaya:     -totalBiayaRaw,
+    komisiPlatform: -komisiPlatform,
+    komisiAfiliasi: -komisiAfiliasi,
+    komisiDinamis:  -komisiDinamis,
+    biayaProses:    -biayaProses,
     totalDilepas, adSpend,
-    // Refund metrics
     refundOrderCount: refundOrders.length,
     refundValue,
     totalOrderCount: orders.length,
     refundRateOrder: orders.length ? (refundOrders.length / orders.length) * 100 : 0,
     refundRateValue: gmvBruto ? (refundValue / gmvBruto) * 100 : 0,
-    // Derived
-    totalFee: totalBiaya,
-    feeRateNetGmv: netGmv ? Math.abs(totalBiaya) / netGmv * 100 : 0,
-    feeRateGross: gmvBruto ? Math.abs(totalBiaya) / gmvBruto * 100 : 0,
-    takeRate: netGmv ? (1 - totalDilepas / netGmv) * 100 : 0,
-    // Shopee compat aliases
+    totalFee:       -totalBiayaRaw,
+    feeRateNetGmv:  netGmv   ? totalBiayaRaw / netGmv   * 100 : 0,
+    feeRateGross:   gmvBruto ? totalBiayaRaw / gmvBruto * 100 : 0,
+    takeRate:       netGmv   ? (1 - totalDilepas / netGmv) * 100 : 0,
     hargaAsli: gmvBruto,
-    diskonProduk: diskonPenjual,
-    refund: 0,
+    diskonProduk: -Math.abs(diskonPenjual),
+    refund: -refundValue,
     voucherSeller: 0,
-    komisiAMS: komisiPlatform,
-    biayaAdmin: komisiAfiliasi + komisiDinamis,
+    komisiAMS:    -komisiPlatform,
+    biayaAdmin:   -(komisiAfiliasi + komisiDinamis),
     biayaLayanan: 0,
     netGmv,
+    dataSource: hasLaporan ? "laporan" : "detail_pesanan",
   };
 
   return { channel: "tiktok", seller: "TikTok Shop", periodStart, periodEnd, summary, orders };
 }
+
 
 
 /* ============================================================================
@@ -1811,7 +1841,7 @@ export default function Sellio() {
 
       {/* tabs */}
       <nav style={S.tabs}>
-        {[["overview", "Overview"], ["strategy", "Strategi"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Inventory"], ["fee", "Fee Marketplace"], ["forecast", "Forecast & Stok"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
+        {[["overview", "Overview"], ["strategy", "Strategi"], ["fee", "Fee Marketplace"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Inventory"], ["forecast", "Forecast & Stok"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
           <button key={k} onClick={() => setTab(k)}
             style={{ ...S.tab, ...(tab === k ? S.tabActive : {}) }}>{lbl}</button>
         ))}
@@ -2221,32 +2251,108 @@ function Overview({ active, snapshots, marginFor, thresholds, activeProducts, sh
       {/* 4. CONTRIBUTION MARGIN */}
       <SectionLabel>CONTRIBUTION MARGIN</SectionLabel>
       <div style={S.cmRow}>
-        {cm.unknown > 0 && cm.knownGmv === 0 ? (
-          <div style={S.cmEmpty}>
-            Set COGS / margin per produk di tab <b>COGS / Margin</b> untuk menghitung contribution margin.
-          </div>
-        ) : (
-          <>
-            <div style={S.cmCard}>
-              <div style={S.cmLabel}>Gross profit (GMV × margin)</div>
-              <div style={S.cmVal}>{rp(cm.grossProfit)}</div>
+        {(() => {
+          // Try marginFor first, fallback to cogsItems direct lookup
+          const cogsMap2 = {};
+          (cogsItems || []).forEach(item => {
+            if (item.harga && item.total) {
+              const pct = (item.harga - item.total) / item.harga * 100;
+              cogsMap2[item.sku] = pct;
+              cogsMap2[item.nama] = pct;
+            }
+          });
+          const getMargin = (ad) => {
+            const m = marginFor(ad);
+            if (m != null) return m;
+            // fallback: match by ad name against cogsItems
+            if (!ad.name) return null;
+            const name = ad.name.toLowerCase();
+            for (const [k, v] of Object.entries(cogsMap2)) {
+              if (k && name.includes(k.toLowerCase().slice(0,10))) return v;
+            }
+            return null;
+          };
+          let grossProfit = 0, adSpendKnown = 0, knownGmv = 0, unknownGmv = 0;
+          active.ads.forEach(ad => {
+            const m = getMargin(ad);
+            if (m != null) {
+              grossProfit += ad.gmv * (m / 100);
+              adSpendKnown += ad.spend;
+              knownGmv += ad.gmv;
+            } else {
+              unknownGmv += ad.gmv;
+            }
+          });
+          const contribution = grossProfit - adSpendKnown;
+          const hasData = knownGmv > 0 || (cogsItems?.length > 0 && cm.knownGmv > 0);
+
+          if (!hasData) return (
+            <div style={S.cmEmpty}>
+              Set COGS / margin per produk di tab <b>COGS / Margin</b> untuk menghitung contribution margin.
             </div>
-            <div style={S.cmCard}>
-              <div style={S.cmLabel}>− Ad spend</div>
-              <div style={S.cmVal}>{rp(active.ads.reduce((t, ad) => t + (marginFor(ad) != null ? ad.spend : 0), 0))}</div>
-            </div>
-            <div style={{ ...S.cmCard, ...S.cmCardFinal }}>
-              <div style={S.cmLabel}>Contribution margin</div>
-              <div style={{ ...S.cmVal, color: cm.contribution >= 0 ? C.good : C.bad }}>{rp(cm.contribution)}</div>
-            </div>
-            {cm.unknown > 0 && <div style={S.cmNote}>⚠ {rpShort(cm.unknown)} GMV belum punya COGS  -  belum dihitung.</div>}
-          </>
-        )}
+          );
+          return (
+            <>
+              <div style={S.cmCard}>
+                <div style={S.cmLabel}>Gross profit (GMV × margin)</div>
+                <div style={S.cmVal}>{rp(knownGmv > 0 ? grossProfit : cm.grossProfit)}</div>
+              </div>
+              <div style={S.cmCard}>
+                <div style={S.cmLabel}>− Ad spend</div>
+                <div style={S.cmVal}>{rp(knownGmv > 0 ? adSpendKnown : active.ads.reduce((t,ad) => t+(marginFor(ad)!=null?ad.spend:0),0))}</div>
+              </div>
+              <div style={{ ...S.cmCard, ...S.cmCardFinal }}>
+                <div style={S.cmLabel}>Contribution margin</div>
+                <div style={{ ...S.cmVal, color: (knownGmv > 0 ? contribution : cm.contribution) >= 0 ? C.good : C.bad }}>{rp(knownGmv > 0 ? contribution : cm.contribution)}</div>
+              </div>
+              {unknownGmv > 0 && <div style={S.cmNote}>⚠ {rpShort(unknownGmv)} GMV belum punya COGS — belum dihitung.</div>}
+            </>
+          );
+        })()}
       </div>
 
-      {/* 5. ACTION PLAN */}
+      {/* 5. STRATEGI HIGHLIGHT */}
+      {(() => {
+        const buckets = { scale: [], hold: [], fix: [] };
+        active.ads.forEach(ad => {
+          const m = marginFor(ad);
+          const dx = diagnose(ad, m, thresholds);
+          if (dx.some(d => d.tag === "SCALE")) buckets.scale.push(ad);
+          else if (dx.some(d => d.tag === "DI BAWAH TARGET" || d.tag === "MAKAN MARGIN")) buckets.hold.push(ad);
+          else if (dx.some(d => d.tag === "CTR RENDAH" || d.tag === "CVR RENDAH")) buckets.fix.push(ad);
+        });
+        const prods = activeProducts?.products || [];
+        const lowStock = prods.filter(p => p.stock != null && p.stock < 10);
+        const sh = shopeeSnap?.summary;
+        const refundAlert = sh?.refundRateValue > 3;
+        const feeAlert = sh?.feeRateNetGmv > 22;
+        const priorities = [];
+        if (buckets.scale.length > 0) priorities.push({ level: "good", text: `${buckets.scale.length} iklan siap scale — naikkan budget 20–30%`, tag: "SCALE" });
+        if (buckets.hold.length > 0) priorities.push({ level: "bad", text: `${buckets.hold.length} iklan di bawah target — ketatkan atau pause`, tag: "HOLD" });
+        if (lowStock.length > 0) priorities.push({ level: "watch", text: `${lowStock.length} produk stok kritis (<10 unit)`, tag: "RESTOCK" });
+        if (refundAlert) priorities.push({ level: "bad", text: `Retur ${sh.refundRateValue.toFixed(1)}% — di atas normal, perlu diaudit`, tag: "RETUR" });
+        if (feeAlert) priorities.push({ level: "watch", text: `Fee rate ${sh.feeRateNetGmv.toFixed(1)}% — cek komposisi voucher & promo`, tag: "FEE" });
+        if (buckets.fix.length > 0) priorities.push({ level: "watch", text: `${buckets.fix.length} iklan CTR/CVR rendah — perlu fix materi atau listing`, tag: "FIX" });
+        if (priorities.length === 0) return null;
+        return (
+          <>
+            <SectionLabel>HIGHLIGHT STRATEGI</SectionLabel>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+              {priorities.slice(0, 4).map((p, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch}`, borderRadius: "0 8px 8px 0", padding: "9px 14px" }}>
+                  <span style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch, background: (p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch) + "18", padding: "2px 7px", borderRadius: 4, letterSpacing: 0.5, flexShrink: 0 }}>{p.tag}</span>
+                  <span style={{ fontFamily: sans, fontSize: 12.5, color: C.ink }}>{p.text}</span>
+                </div>
+              ))}
+              {priorities.length > 4 && <div style={{ fontFamily: sans, fontSize: 11, color: C.muted, paddingLeft: 4 }}>+{priorities.length - 4} item lain — lihat tab Strategi untuk detail lengkap.</div>}
+            </div>
+          </>
+        );
+      })()}
+
+      {/* 6. ACTION PLAN */}
       <SectionLabel>ACTION PLAN</SectionLabel>
-      <ActionPlan active={active} marginFor={marginFor} agg={agg} thresholds={thresholds} />
+      <ActionPlan active={active} marginFor={marginFor} agg={agg} thresholds={thresholds} cogsItems={cogsItems} />
     </div>
   );
 }
@@ -2258,7 +2364,7 @@ function deltaStr(d) {
 }
 
 /* aggregated action plan: pulls worst offenders + scale candidates */
-function ActionPlan({ active, marginFor, thresholds }) {
+function ActionPlan({ active, marginFor, thresholds, cogsItems }) {
   const items = useMemo(() => {
     const scale = [], cut = [], fix = [];
     active.ads.forEach((ad) => {
@@ -2273,7 +2379,7 @@ function ActionPlan({ active, marginFor, thresholds }) {
     return { scale, cut, fix };
   }, [active, marginFor, thresholds]);
 
-  const noMargin = active.ads.every((ad) => marginFor(ad) == null);
+  const noMargin = active.ads.every((ad) => marginFor(ad) == null) && !(cogsItems?.length > 0);
   if (noMargin) return <div style={S.cmEmpty}>Action plan butuh margin. Isi COGS dulu untuk rekomendasi scale/hold yang akurat.</div>;
 
   return (
