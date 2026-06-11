@@ -712,24 +712,26 @@ function parseTikTokIncomeXlsx(buf) {
     return isNaN(x) ? 0 : x;
   };
 
-  // ── 1. Read Laporan sheet for authoritative summary ──
+  // ── 1. Read Laporan sheet ──
+  // Structure: label in col 1-4 (varying indent), value ALWAYS in col 5 (index 5)
   let laporan = {};
   let periodStart = "", periodEnd = "";
   const lsh = wb.Sheets["Laporan"];
   if (lsh) {
     const lrows = readSheetRows(lsh);
     lrows.forEach(row => {
-      const label = String(row[0] || "").trim();
-      const label2 = String(row[1] || "").trim();
-      const val1 = n(row[1]);
-      const val2 = n(row[2]);
-      if (label) laporan[label] = val1 || val2;
-      if (label2 && label2 !== label) laporan[label2] = val2 || val1;
+      // Value is always at index 5
+      const val = n(row[5]);
+      // Label is in whichever of col 1-4 is non-empty
+      const label = [row[1], row[2], row[3], row[4]]
+        .map(v => String(v || "").trim())
+        .find(v => v !== "") || "";
+      if (label) laporan[label] = val;
     });
-    // Parse period
-    const periodeRow = lrows.find(r => String(r[0]).trim() === "Periode");
+    // Parse period from col 5 string value
+    const periodeRow = lrows.find(r => String(r[1] || "").trim() === "Periode");
     if (periodeRow) {
-      const parts = String(periodeRow[1] || "").split("-");
+      const parts = String(periodeRow[5] || "").split("-");
       if (parts.length === 2) {
         periodStart = parts[0].trim().replace(/\//g, "-");
         periodEnd   = parts[1].trim().replace(/\//g, "-");
@@ -737,7 +739,7 @@ function parseTikTokIncomeXlsx(buf) {
     }
   }
 
-  // ── 2. Read Detail pesanan for per-order breakdown ──
+  // ── 2. Read Detail pesanan ──
   const rows = readSheetRows(sh);
   if (!rows.length) throw new Error("File kosong.");
   const hdrs = rows[0].map(c => String(c ?? "").trim());
@@ -778,8 +780,8 @@ function parseTikTokIncomeXlsx(buf) {
     }
   }
 
-  // ── 3. Use Laporan as authoritative, per-order as fallback ──
-  const hasLaporan = laporan["Subtotal sebelum diskon"] > 0;
+  // ── 3. Use Laporan as authoritative source ──
+  const hasLaporan = (laporan["Subtotal sebelum diskon"] || 0) > 0;
 
   const gmvBruto       = hasLaporan ? laporan["Subtotal sebelum diskon"]         : orders.reduce((t,o) => t + o.subtotalBruto, 0);
   const diskonPenjual  = hasLaporan ? laporan["Diskon penjual"]                  : orders.reduce((t,o) => t + o.diskonPenjual, 0);
@@ -792,7 +794,6 @@ function parseTikTokIncomeXlsx(buf) {
   const totalDilepas   = hasLaporan ? laporan["Jumlah penyelesaian pembayaran"]  : orders.reduce((t,o) => t + o.settlement, 0);
   const adSpend        = adPayments.reduce((t,v) => t + v, 0);
 
-  // Refund
   const refundValue    = hasLaporan
     ? Math.abs(laporan["Subtotal pengembalian dana sebelum diskon penjual"] || 0)
     : orders.filter(o => o.subtotalRefund < 0).reduce((t,o) => t + Math.abs(o.subtotalRefund), 0);
@@ -832,66 +833,6 @@ function parseTikTokIncomeXlsx(buf) {
   return { channel: "tiktok", seller: "TikTok Shop", periodStart, periodEnd, summary, orders };
 }
 
-
-
-/* ============================================================================
-   SHOPEE ORDER EXPORT PARSER  -  "orders" sheet
-   Columns: No. Pesanan, Status Pesanan, SKU Induk, Nama Produk,
-   Jumlah, Kota/Kabupaten, Provinsi, Waktu Pesanan Dibuat, dll
-   ========================================================================== */
-function parseOrderXlsx(buf) {
-  const wb = XLSX.read(buf, { type: "array" });
-  const sh = wb.Sheets["orders"] || wb.Sheets[wb.SheetNames[0]];
-  if (!sh) throw new Error("Sheet tidak ditemukan.");
-
-  const range = XLSX.utils.decode_range(sh["!ref"] || "A1:AX2000");
-  const rows = [];
-  for (let R = range.s.r; R <= range.e.r; R++) {
-    const row = [];
-    for (let CC = range.s.c; CC <= range.e.c; CC++) {
-      const cell = sh[XLSX.utils.encode_cell({ r: R, c: CC })];
-      row.push(cell ? cell.v : "");
-    }
-    rows.push(row);
-  }
-  if (!rows.length) throw new Error("File kosong.");
-
-  const hdrs = rows[0].map(c => String(c ?? "").trim());
-  const col = name => hdrs.indexOf(name);
-
-  const SELESAI = ["Selesai", "Completed"];
-  const ACTIVE = str => str && !str.startsWith("Batal") && !str.startsWith("Cancel");
-
-  const orders = [];
-  let periodStart = "", periodEnd = "";
-
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    if (!r[col("No. Pesanan")]) continue;
-    const status = String(r[col("Status Pesanan")] ?? "").trim();
-    if (!ACTIVE(status)) continue; // exclude cancelled
-
-    const tgl = String(r[col("Waktu Pesanan Dibuat")] ?? "").slice(0, 10);
-    if (tgl) {
-      if (!periodStart || tgl < periodStart) periodStart = tgl;
-      if (!periodEnd   || tgl > periodEnd)   periodEnd   = tgl;
-    }
-    const qty = parseFloat(String(r[col("Jumlah")] ?? "").replace(/[^0-9.]/g,"")) || 1;
-    orders.push({
-      noPesanan: String(r[col("No. Pesanan")] || ""),
-      status,
-      selesai: SELESAI.includes(status),
-      skuInduk: String(r[col("SKU Induk")] || ""),
-      namaProduk: String(r[col("Nama Produk")] || ""),
-      jumlah: qty,
-      kota: String(r[col("Kota/Kabupaten")] || "").trim(),
-      provinsi: String(r[col("Provinsi")] || "").trim(),
-      tglDibuat: tgl,
-    });
-  }
-
-  return { periodStart, periodEnd, orders };
-}
 
 
 /* ============================================================================
