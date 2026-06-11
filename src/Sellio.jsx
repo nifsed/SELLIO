@@ -9,7 +9,7 @@ import * as XLSX from "xlsx";
 
 /* ---------- IndexedDB (no deps) ------------------------------------------ */
 const DB_NAME = "sellio";
-const DB_VER = 12;
+const DB_VER = 13;
 function openDB() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(DB_NAME, DB_VER);
@@ -37,6 +37,7 @@ function openDB() {
         db.createObjectStore("meta_ads", { keyPath: "id" }); // Meta Ads snapshots
       if (!db.objectStoreNames.contains("tiktok_ads"))
         db.createObjectStore("tiktok_ads", { keyPath: "id" }); // TikTok Ads (GMV Max) snapshots
+        db.createObjectStore("tiktok_campaign", { keyPath: "id" }); // TikTok per-campaign/product
       if (!db.objectStoreNames.contains("pnl_inputs"))
         db.createObjectStore("pnl_inputs", { keyPath: "key" }); // P&L manual inputs
     };
@@ -936,6 +937,95 @@ function parseCOGSXlsx(buf) {
 
 
 /* ============================================================================
+   TIKTOK CAMPAIGN PER PRODUK PARSER
+   File: creative_data_for_product_campaigns_...xlsx
+   Columns: Nama kampanye, ID Campaign, ID produk, Jenis materi iklan,
+            Biaya, Pesanan SKU, Biaya per pesanan, Pendapatan kotor, ROI
+   ========================================================================== */
+function parseTikTokCampaignXlsx(buf) {
+  const wb = XLSX.read(buf, { type: "array" });
+  const sh = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sh, { header: 1, defval: "" });
+  if (!rows.length) throw new Error("File kosong.");
+
+  const hdrs = rows[0].map(c => String(c ?? "").trim());
+  const col  = name => hdrs.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+
+  const colCampaign   = col("nama kampanye");
+  const colCampaignId = col("id campaign");
+  const colProductId  = col("id produk");
+  const colSpend      = col("biaya");
+  const colOrders     = col("pesanan sku");
+  const colCpa        = col("biaya per pesanan");
+  const colGmv        = col("pendapatan kotor");
+  const colRoi        = col("roi");
+  const colStatus     = col("status");
+  const colImpr       = col("impresi");
+  const colClicks     = col("jumlah klik");
+  const colCtr        = col("tingkat klik");
+  const colCvr        = col("rasio konversi");
+
+  const n  = v => { const x = typeof v === "number" ? v : parseFloat(String(v).replace(/[^0-9.-]/g,"")); return isNaN(x) ? 0 : x; };
+  const pct = v => { const s = String(v ?? "").replace("%","").trim(); const x = parseFloat(s); return isNaN(x) ? 0 : x; };
+
+  const campaignMap = {};
+  let totalSpend = 0, totalOrders = 0, totalGmv = 0;
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r[colCampaign]) continue;
+    const camp   = String(r[colCampaign]).trim();
+    const campId = String(r[colCampaignId] || camp).trim();
+    const prodId = String(r[colProductId] || "").trim();
+    const spend  = n(r[colSpend]);
+    const orders = n(r[colOrders]);
+    const gmv    = n(r[colGmv]);
+    const roi    = n(r[colRoi]);
+    const cpa    = n(r[colCpa]);
+    const status = String(r[colStatus] || "").trim();
+    const impr   = colImpr   >= 0 ? n(r[colImpr])     : 0;
+    const clicks = colClicks >= 0 ? n(r[colClicks])    : 0;
+    const ctr    = colCtr    >= 0 ? pct(r[colCtr])     : 0;
+    const cvr    = colCvr    >= 0 ? pct(r[colCvr])     : 0;
+
+    if (!campaignMap[campId]) campaignMap[campId] = {
+      name: camp, id: campId,
+      spend: 0, orders: 0, gmv: 0, impr: 0, clicks: 0,
+      roiSum: 0, roiCount: 0, ctrSum: 0, ctrCount: 0, cvrSum: 0, cvrCount: 0,
+      products: []
+    };
+    const c = campaignMap[campId];
+    c.spend  += spend;  c.orders += orders; c.gmv += gmv;
+    c.impr   += impr;   c.clicks += clicks;
+    if (roi  > 0) { c.roiSum += roi; c.roiCount++; }
+    if (ctr  > 0) { c.ctrSum += ctr; c.ctrCount++; }
+    if (cvr  > 0) { c.cvrSum += cvr; c.cvrCount++; }
+    c.products.push({ prodId, spend, orders, gmv, roi, cpa, status, impr, clicks, ctr, cvr });
+
+    totalSpend += spend; totalOrders += orders; totalGmv += gmv;
+  }
+
+  const campaigns = Object.values(campaignMap).map(c => ({
+    ...c,
+    roi: c.spend > 0 ? c.gmv / c.spend : 0,
+    ctr: c.ctrCount > 0 ? c.ctrSum / c.ctrCount : (c.clicks > 0 && c.impr > 0 ? c.clicks / c.impr * 100 : 0),
+    cvr: c.cvrCount > 0 ? c.cvrSum / c.cvrCount : 0,
+  })).sort((a, b) => b.gmv - a.gmv);
+
+  return {
+    id: "tiktok_campaign|" + Date.now(),
+    campaigns,
+    summary: {
+      totalSpend, totalOrders, totalGmv,
+      blendedRoi: totalSpend > 0 ? totalGmv / totalSpend : 0,
+      campaignCount: campaigns.length,
+      totalImpr: campaigns.reduce((t,c) => t + c.impr, 0),
+    },
+    importedAt: Date.now(),
+  };
+}
+
+   /* ============================================================================
    META ADS CSV PARSER  -  Facebook/Instagram Ads Manager export
    Columns: Campaign name, Impressions, Reach, Results, Result type,
    Amount spent (IDR), CTR (all), CPC (all), Cost per result,
@@ -1206,6 +1296,7 @@ export default function Sellio() {
   const [cogsItems, setCogsItems] = useState([]); // [{sku, nama, hpp_prod, hpp_pack, hpp_lain, total, harga}]
   const [metaSnaps, setMetaSnaps] = useState([]);   // Meta Ads snapshots
   const [tiktokAdsSnaps, setTiktokAdsSnaps] = useState([]); // TikTok Ads (GMV Max) snapshots
+  const [tiktokCampaignSnap, setTiktokCampaignSnap] = useState(null); // TikTok per-campaign/product
   const [pnlInputs, setPnlInputs] = useState({}); // P&L manual inputs
   const [stockMap, setStockMap] = useState({}); // code -> units
   const [thresholds, setThresholds] = useState(DEFAULT_TH);
@@ -1226,6 +1317,7 @@ export default function Sellio() {
   const cogsFileRef = useRef();
   const metaFileRef = useRef();
   const tiktokAdsFileRef = useRef();
+  const tiktokCampaignFileRef = useRef();
 
   useEffect(() => {
     (async () => {
@@ -1264,6 +1356,8 @@ export default function Sellio() {
       const tiktokAds = await idbAll("tiktok_ads");
       tiktokAds.sort((a, b) => (a.periodEnd < b.periodEnd ? 1 : -1));
       setTiktokAdsSnaps(tiktokAds);
+      const ttCamps = await idbAll("tiktok_campaign");
+      if (ttCamps.length > 0) setTiktokCampaignSnap(ttCamps[ttCamps.length - 1]);
       const pnlRecs = await idbAll("pnl_inputs");
       const pnlMap = {};
       pnlRecs.forEach(r => { pnlMap[r.key] = r.value; });
@@ -1295,7 +1389,7 @@ export default function Sellio() {
         tx.oncomplete = res; tx.onerror = rej;
       })
     ));
-    setSnapshots([]); setProducts([]); setCogsMap({}); setStockMap({}); setIncomeSnaps([]); setTiktokSnaps([]); setOrderSnaps([]); setCogsItems([]); setMetaSnaps([]); setTiktokAdsSnaps([]); setPnlInputs({});
+    setSnapshots([]); setProducts([]); setCogsMap({}); setStockMap({}); setIncomeSnaps([]); setTiktokSnaps([]); setOrderSnaps([]); setCogsItems([]); setMetaSnaps([]); setTiktokAdsSnaps([]); setTiktokCampaignSnap(null); setPnlInputs({});
     setActiveId(null); setThresholds(DEFAULT_TH);
     flash("Semua data direset.");
   }
@@ -1377,6 +1471,23 @@ export default function Sellio() {
     e.target.value = "";
   }
 
+  async function handleTikTokCampaignFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+      const buf = await f.arrayBuffer();
+      const parsed = parseTikTokCampaignXlsx(buf);
+      await new Promise((res,rej) => { openDB().then(db => { const tx=db.transaction("tiktok_campaign","readwrite"); tx.objectStore("tiktok_campaign").clear(); tx.oncomplete=res; tx.onerror=rej; }); });
+      await idbPut("tiktok_campaign", parsed);
+      setTiktokCampaignSnap(parsed);
+      setTab("performance");
+      flash(`TikTok Campaign: ${parsed.summary.campaignCount} kampanye · ${parsed.summary.totalOrders} orders`);
+    } catch(err) {
+      flash("Gagal baca file TikTok Campaign: " + err.message);
+    }
+    e.target.value = "";
+  }
+
   async function handleMetaFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -1403,12 +1514,27 @@ export default function Sellio() {
     try {
       const buf = await f.arrayBuffer();
       const items = parseCOGSXlsx(buf);
-      // Save each item to IDB
       const db = await openDB();
+      // Save to cogs_items (for Unit Economics / CM / PnL)
       await new Promise((res, rej) => { const tx = db.transaction("cogs_items","readwrite"); tx.objectStore("cogs_items").clear(); tx.oncomplete=res; tx.onerror=rej; });
       for (const item of items) await idbPut("cogs_items", item);
       setCogsItems(items);
-      flash(`COGS: ${items.length} SKU diimport`);
+
+      // Also save margin% to cogs store so marginFor() works in Performance/Strategy
+      const newCogsMap = { ...cogsMap };
+      for (const item of items) {
+        if (!item.harga || !item.total) continue;
+        const marginPct = Math.max(0, Math.min(100, (item.harga - item.total) / item.harga * 100));
+        // Key by SKU (c: prefix) or name (n: prefix) — same as keyFor()
+        const key = item.sku && item.sku !== "-" && item.sku !== item.nama
+          ? "c:" + item.sku
+          : "n:" + item.nama;
+        const rec = { key, label: item.nama, marginPct };
+        await idbPut("cogs", rec);
+        newCogsMap[key] = rec;
+      }
+      setCogsMap(newCogsMap);
+      flash(`COGS: ${items.length} SKU diimport · margin otomatis terhubung ke Performa Iklan`);
     } catch(err) {
       flash("Gagal baca file COGS: " + err.message);
     }
@@ -1557,6 +1683,7 @@ export default function Sellio() {
                 {[
                   { label: "Shopee Ads", sub: "Shopee Ads Manager → Laporan → Export CSV", icon: "📊", action: () => adFileRef.current.click(), accent: C.accent },
                   { label: "TikTok GMV Max", sub: "TikTok Ads Manager → Campaign Overview → Export", icon: "⬛", action: () => tiktokAdsFileRef.current.click(), accent: "#010101" },
+                  { label: "TikTok Per Campaign", sub: "TikTok Ads Manager → Campaign → Creative → Export", icon: "⬛", action: () => tiktokCampaignFileRef.current.click(), accent: "#fe2c55" },
                   { label: "Meta Ads", sub: "Meta Ads Manager → Export → CSV", icon: "🔵", action: () => metaFileRef.current.click(), accent: "#1877f2" },
                 ].map((item, i) => (
                   <button key={i} style={S.importMenuItem} onClick={() => { item.action(); setImportMenuOpen(false); }}>
@@ -1633,6 +1760,7 @@ export default function Sellio() {
           <input ref={cogsFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleCogsFile} />
           <input ref={metaFileRef} type="file" accept=".csv" hidden onChange={handleMetaFile} />
           <input ref={tiktokAdsFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleTikTokAdsFile} />
+          <input ref={tiktokCampaignFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleTikTokCampaignFile} />
         </div>
       </header>
 
@@ -1681,7 +1809,7 @@ export default function Sellio() {
 
       {/* tabs */}
       <nav style={S.tabs}>
-        {[["overview", "Overview"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Inventory"], ["fee", "Fee Marketplace"], ["forecast", "Forecast & Stok"], ["strategy", "Strategi"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
+        {[["overview", "Overview"], ["strategy", "Strategi"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Inventory"], ["fee", "Fee Marketplace"], ["forecast", "Forecast & Stok"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
           <button key={k} onClick={() => setTab(k)}
             style={{ ...S.tab, ...(tab === k ? S.tabActive : {}) }}>{lbl}</button>
         ))}
@@ -1690,14 +1818,37 @@ export default function Sellio() {
       <main style={S.main}>
         {!hasAds && !hasProd && ["overview","performance","strategy","forecast","cogs"].includes(tab) && <EmptyState onImportAds={() => adFileRef.current.click()} onImportProd={() => prodFileRef.current.click()} />}
         {hasAds && tab === "overview" && <Overview active={active} snapshots={snapshots} marginFor={marginFor} thresholds={thresholds} activeProducts={activeProducts} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} orderSnap={orderSnaps[0]||null} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} cogsItems={cogsItems} onGoToCogs={() => setTab("cogs")} />}
-        {hasAds && tab === "performance" && <Performance active={active} marginFor={marginFor} thresholds={thresholds} saveThresholds={saveThresholds} activeProducts={activeProducts} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} />}
+        {hasAds && tab === "performance" && <Performance active={active} marginFor={marginFor} thresholds={thresholds} saveThresholds={saveThresholds} activeProducts={activeProducts} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} tiktokCampaignSnap={tiktokCampaignSnap} onImportTiktokCampaign={() => tiktokCampaignFileRef.current.click()} />}
         {tab === "product" && (hasProd
           ? <ProductTab snap={activeProducts} thresholds={thresholds} active={active} feeRate={(incomeSnaps[0]?.summary?.feeRateNetGmv) || (tiktokSnaps[0]?.summary?.feeRateNetGmv) || 0} />
           : <ProductEmpty onImport={() => prodFileRef.current.click()} />)}
         {tab === "inventory" && (hasProd
           ? <InventoryTab snap={activeProducts} active={active} thresholds={thresholds} stockMap={stockMap} setStockMap={setStockMap} />
           : <ProductEmpty onImport={() => prodFileRef.current.click()} />)}
-        {hasAds && tab === "strategy" && <Strategy active={active} marginFor={marginFor} thresholds={thresholds} />}
+        {tab === "strategy" && !hasAds && (
+          <div style={{ padding: "40px 0", textAlign: "center" }}>
+            <div style={{ fontFamily: mono, fontSize: 13, fontWeight: 700, color: C.muted, marginBottom: 12 }}>Strategi butuh data dari tab lain dulu</div>
+            <div style={{ fontFamily: sans, fontSize: 12.5, color: C.muted, lineHeight: 1.7, maxWidth: 480, margin: "0 auto", marginBottom: 20 }}>
+              Untuk analisa strategi yang komprehensif, import minimal:<br/>
+              <b style={{ color: C.ink }}>Shopee Ads</b> (wajib) · <b style={{ color: C.ink }}>Performa Produk</b> · <b style={{ color: C.ink }}>Penghasilan Shopee</b> · <b style={{ color: C.ink }}>COGS</b><br/>
+              Makin banyak data yang diimport, makin tajam rekomendasinya.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10, maxWidth: 640, margin: "0 auto", textAlign: "left" }}>
+              {[
+                { icon: "📢", label: "Shopee Ads", desc: "Wajib · basis diagnosa iklan", done: hasAds },
+                { icon: "📦", label: "Performa Produk", desc: "Stok & BCG Matrix", done: !!activeProducts },
+                { icon: "💸", label: "Penghasilan Shopee/TikTok", desc: "Fee rate & retur", done: incomeSnaps.length > 0 || tiktokSnaps.length > 0 },
+                { icon: "🧮", label: "COGS / HPP", desc: "Break-even & margin", done: cogsItems?.length > 0 },
+              ].map((item, i) => (
+                <div key={i} style={{ background: C.panel, border: `1px solid ${item.done ? C.good : C.line}`, borderLeft: `3px solid ${item.done ? C.good : C.dim}`, borderRadius: "0 8px 8px 0", padding: "10px 14px" }}>
+                  <div style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, color: item.done ? C.good : C.ink }}>{item.icon} {item.label} {item.done ? "✓" : ""}</div>
+                  <div style={{ fontFamily: sans, fontSize: 11, color: C.muted }}>{item.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {hasAds && tab === "strategy" && <Strategy active={active} marginFor={marginFor} thresholds={thresholds} activeProducts={activeProducts} cogsItems={cogsItems} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} metaSnap={metaSnaps[0]||null} incomeSnaps={incomeSnaps} tiktokSnaps={tiktokSnaps} />}
         {tab === "forecast" && (hasAds
           ? <Forecast active={active} activeProducts={activeProducts} thresholds={thresholds} marginFor={marginFor} />
           : <div style={S.cmEmpty}>Forecast butuh file iklan untuk benchmark ROAS/CVR. Import <b>File Iklan (CSV)</b> dulu{!hasProd ? ", idealnya plus File Produk untuk alokasi per kuadran BCG." : "."}</div>)}
@@ -2147,7 +2298,7 @@ function PlanCol({ title, color, items }) {
 }
 
 /* ---------- Performance --------------------------------------------------- */
-function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, tiktokAdsSnap }) {
+function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, tiktokAdsSnap, tiktokCampaignSnap, onImportTiktokCampaign }) {
   const [channel, setChannel] = useState("shopee");
   const [sort, setSort] = useState("spend");
   const [dir, setDir] = useState(-1);
@@ -2185,11 +2336,138 @@ function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, 
         })}
       </div>
 
+      {/* Disclaimer */}
+      <div style={{ display: "flex", gap: 10, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 14px", marginBottom: 14, fontFamily: sans, fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+        <span style={{ fontSize: 13, flexShrink: 0, marginTop: 1 }}>ℹ️</span>
+        <div>
+          <b style={{ color: C.ink }}>Data 100% identik dengan file ekspor resmi {channel === "tiktokads" ? "TikTok Shop" : channel === "meta" ? "Meta Ads Manager" : "Shopee Seller Center"}.</b>{" "}
+          Sellio membaca file langsung tanpa modifikasi — angka yang tampil di sini adalah angka yang sama persis dengan yang ada di dashboard channel kamu. Jika ada perbedaan dengan laporan internal, kemungkinan bersumber dari perbedaan periode, timezone, atau metode agregasi di sisi platform.
+          {" "}<b style={{ color: C.ink }}>Diagnosa dan saran yang ditampilkan adalah gambaran awal berbasis data.</b>{" "}
+          Untuk keputusan strategis lebih lanjut, validasi dengan metrics lain sebelum eksekusi.{" "}
+          <a href="https://wa.me/6282130311844" target="_blank" rel="noreferrer"
+            style={{ color: C.accent, fontWeight: 700, textDecoration: "none" }}>
+            Jadwalkan konsultasi →
+          </a>
+        </div>
+      </div>
+
       {channel === "meta" && metaSnap && <MetaAdsView snap={metaSnap} />}
-      {channel === "tiktokads" && tiktokAdsSnap && <TikTokAdsView snap={tiktokAdsSnap} />}
+      {channel === "tiktokads" && tiktokAdsSnap && <TikTokAdsView snap={tiktokAdsSnap} campaignSnap={tiktokCampaignSnap} onImportCampaign={onImportTiktokCampaign} />}
       {channel === "all" && <AllChannelView active={active} metaSnap={metaSnap} tiktokAdsSnap={tiktokAdsSnap} />}
       {channel === "shopee" && <>
       <ThresholdPanel thresholds={thresholds} saveThresholds={saveThresholds} />
+
+      {/* Scatter ROAS vs Spend + Ranking panel */}
+      {active.ads.length > 0 && (() => {
+        const ads = active.ads.filter(a => a.spend > 0);
+        const maxSpend = Math.max(...ads.map(a => a.spend), 1);
+        const maxRoas  = Math.max(...ads.map(a => a.roas), 1);
+        const W = 340, H = 200, pad = 36;
+        const targetRoas = thresholds.targetRoas || 5;
+        const cx = a => pad + (a.spend / maxSpend) * (W - pad * 1.5);
+        const cy = a => H - pad - (a.roas / (maxRoas * 1.1)) * (H - pad * 1.5);
+        // Ranking by ROAS
+        const ranked = [...ads].sort((a,b) => b.roas - a.roas).slice(0, 10);
+        const maxBarSpend = Math.max(...ranked.map(a => a.spend), 1);
+        return (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+            {/* Scatter */}
+            <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px" }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1.2, marginBottom: 8 }}>ROAS vs SPEND · tiap titik = 1 iklan</div>
+              <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", overflow: "visible" }}>
+                {/* Grid */}
+                {[0, 0.25, 0.5, 0.75, 1].map((r,i) => (
+                  <g key={i}>
+                    <line x1={pad} x2={W - pad/2} y1={H - pad - r*(H-pad*1.5)} y2={H - pad - r*(H-pad*1.5)} stroke={C.line} strokeWidth="0.5" />
+                    <text x={pad - 4} y={H - pad - r*(H-pad*1.5) + 3} textAnchor="end" fontSize="7.5" fill={C.dim} fontFamily="monospace">{(maxRoas * 1.1 * r).toFixed(1)}x</text>
+                  </g>
+                ))}
+                {/* Target ROAS line */}
+                {targetRoas <= maxRoas * 1.1 && (
+                  <line x1={pad} x2={W - pad/2}
+                    y1={H - pad - (targetRoas / (maxRoas * 1.1)) * (H - pad * 1.5)}
+                    y2={H - pad - (targetRoas / (maxRoas * 1.1)) * (H - pad * 1.5)}
+                    stroke={C.accent} strokeWidth="0.8" strokeDasharray="4,3" />
+                )}
+                <text x={W - pad/2 + 2} y={H - pad - (targetRoas / (maxRoas * 1.1)) * (H - pad * 1.5) + 3} fontSize="7" fill={C.accent} fontFamily="monospace">target</text>
+                {/* X axis */}
+                <line x1={pad} x2={W - pad/2} y1={H - pad} y2={H - pad} stroke={C.line} strokeWidth="0.5" />
+                <text x={pad} y={H - 4} fontSize="7.5" fill={C.dim} fontFamily="monospace">spend rendah</text>
+                <text x={W - pad/2} y={H - 4} textAnchor="end" fontSize="7.5" fill={C.dim} fontFamily="monospace">spend tinggi</text>
+                {/* Dots */}
+                {ads.map((a, i) => {
+                  const x = cx(a), y = cy(a);
+                  const col = a.roas >= targetRoas * 1.5 ? C.good : a.roas >= targetRoas ? C.accent : a.roas >= targetRoas * 0.75 ? C.watch : C.bad;
+                  const r = Math.max(4, Math.min(10, 4 + (a.spend / maxSpend) * 6));
+                  const rowIdx = rows.findIndex(r => r.name === a.name);
+                  const isSelected = open === rowIdx;
+                  return (
+                    <g key={i} style={{ cursor: "pointer" }}
+                      onClick={() => {
+                        setOpen(isSelected ? null : rowIdx);
+                        setTimeout(() => {
+                          const el = document.getElementById("adrow-" + rowIdx);
+                          if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                        }, 60);
+                      }}>
+                      <circle cx={x} cy={y} r={isSelected ? r + 3 : r}
+                        fill={col} fillOpacity={isSelected ? 1 : 0.75}
+                        stroke={isSelected ? "#fff" : col} strokeWidth={isSelected ? 2 : 0.5} />
+                      {isSelected && (
+                        <text x={x + r + 4} y={y + 3} fontSize="8.5" fontFamily="monospace" fill={col} fontWeight="700">
+                          {a.name.length > 20 ? a.name.slice(0,20)+"…" : a.name}
+                        </text>
+                      )}
+                      <title>{`${a.name}\nSpend: ${rpShort(a.spend)}\nROAS: ${a.roas.toFixed(2)}x\nGMV: ${rpShort(a.gmv)}`}</title>
+                    </g>
+                  );
+                })}
+              </svg>
+              <div style={{ display: "flex", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                {[[C.good, `≥${(targetRoas*1.5).toFixed(1)}x scale`],[C.accent,`≥${targetRoas}x on target`],[C.watch,"mendekati batas"],[C.bad,"di bawah target"]].map(([c,l])=>(
+                  <div key={l} style={{ display:"flex", alignItems:"center", gap:4, fontFamily:mono, fontSize:9, color:C.muted }}>
+                    <div style={{ width:8, height:8, borderRadius:"50%", background:c, opacity:0.8 }} />{l}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Ranking horizontal bar */}
+            <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px" }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1.2, marginBottom: 10 }}>RANKING ROAS · top 10 iklan</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {ranked.map((a, i) => {
+                  const roasCol = a.roas >= targetRoas * 1.5 ? C.good : a.roas >= targetRoas ? C.accent : a.roas >= targetRoas * 0.75 ? C.watch : C.bad;
+                  const spendW  = (a.spend / maxBarSpend * 100).toFixed(0);
+                  const shortName = a.name.length > 22 ? a.name.slice(0, 22) + "…" : a.name;
+                  const rowIdx = rows.findIndex(r => r.name === a.name);
+                  const isSelected = open === rowIdx;
+                  return (
+                    <div key={i} style={{ cursor: "pointer" }} onClick={() => {
+                      setOpen(isSelected ? null : rowIdx);
+                      setTimeout(() => {
+                        const el = document.getElementById("adrow-" + rowIdx);
+                        if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                      }, 60);
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, background: isSelected ? roasCol+"18" : "transparent", borderRadius: 4, padding: "1px 4px" }}>
+                        <span style={{ fontFamily: sans, fontSize: 10.5, color: isSelected ? roasCol : C.ink, fontWeight: isSelected ? 700 : 400, flex: 1, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>{shortName}</span>
+                        <div style={{ display: "flex", gap: 8, flexShrink: 0, marginLeft: 8 }}>
+                          <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, color: roasCol }}>{a.roas.toFixed(1)}x</span>
+                          <span style={{ fontFamily: mono, fontSize: 10, color: C.dim }}>{rpShort(a.spend)}</span>
+                        </div>
+                      </div>
+                      <div style={{ height: 5, background: C.panel2, borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ width: spendW + "%", height: "100%", background: roasCol, opacity: isSelected ? 1 : 0.7, borderRadius: 3 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       <div style={S.perfBar}>
         <SectionLabel inline>PER IKLAN · {active.ads.length}</SectionLabel>
         <input placeholder="cari iklan..." value={q} onChange={(e) => setQ(e.target.value)} style={S.search} />
@@ -2220,7 +2498,7 @@ function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, 
               const effTarget = m != null && thresholds.autoRoasFromMargin ? Math.max(thresholds.targetRoas, 100 / m) : thresholds.targetRoas;
               return (
                 <React.Fragment key={i}>
-                  <tr style={{ ...S.tr, cursor: "pointer" }} onClick={() => setOpen(isOpen ? null : i)}>
+                  <tr style={{ ...S.tr, cursor: "pointer" }} id={"adrow-" + i} onClick={() => setOpen(isOpen ? null : i)}>
                     <td style={{ ...S.td, color: C.muted, fontFamily: mono }}>{isOpen ? "▾" : "▸"}</td>
                     <td style={S.td}>
                       <div style={S.adName}>{ad.name}</div>
@@ -2303,8 +2581,18 @@ function Dot({ level }) {
 }
 
 /* ---------- Strategy ------------------------------------------------------ */
-function Strategy({ active, marginFor, thresholds }) {
+function Strategy({ active, marginFor, thresholds, activeProducts, cogsItems, shopeeSnap, tiktokSnap, tiktokAdsSnap, metaSnap }) {
+
+  // ── 0. Data completeness ──
+  const missing = [];
+  if (!activeProducts) missing.push({ icon: "📦", label: "Performa Produk Shopee", hint: "untuk analisa stok & dead stock" });
+  if (!shopeeSnap && !tiktokSnap) missing.push({ icon: "💸", label: "Penghasilan Shopee / TikTok", hint: "untuk fee rate & data retur" });
+  if (!cogsItems?.length) missing.push({ icon: "🧮", label: "COGS / HPP", hint: "untuk break-even yang akurat" });
+  if (!tiktokAdsSnap) missing.push({ icon: "⬛", label: "TikTok GMV Max", hint: "untuk analisa ROI TikTok" });
+
   const noMargin = active.ads.every((ad) => marginFor(ad) == null);
+
+  // ── 1. Ad buckets (existing logic) ──
   const buckets = useMemo(() => {
     const b = { scale: [], hold: [], material: [], landing: [], healthy: [] };
     active.ads.forEach((ad) => {
@@ -2319,36 +2607,255 @@ function Strategy({ active, marginFor, thresholds }) {
     return b;
   }, [active, marginFor, thresholds]);
 
+  // ── 2. Cross-tab health signals + BCG ──
+  const bcgData = useMemo(() => {
+    if (!activeProducts?.products?.length) return null;
+    const adMap = {};
+    active.ads.forEach(ad => { if (ad.code) adMap[ad.code] = ad; });
+    const feeRate = shopeeSnap?.summary?.feeRateNetGmv || tiktokSnap?.summary?.feeRateNetGmv || 0;
+    return classifyBCG(activeProducts.products, adMap, feeRate);
+  }, [activeProducts, active, shopeeSnap, tiktokSnap]);
+  const signals = useMemo(() => {
+    const items = [];
+
+    // Ads health
+    const totalAds = active.ads.length;
+    const badAds = buckets.hold.length + buckets.material.length + buckets.landing.length;
+    const scaleAds = buckets.scale.length;
+    const adHealth = totalAds ? ((totalAds - badAds) / totalAds * 100) : 0;
+    items.push({
+      area: "Performa Iklan",
+      score: adHealth,
+      good: `${scaleAds} iklan siap scale · ${buckets.healthy.length} healthy`,
+      bad: badAds > 0 ? `${badAds} iklan perlu perhatian (hold/fix)` : null,
+      icon: "📢"
+    });
+
+    // BCG health
+    if (bcgData?.length > 0) {
+      const stars    = bcgData.filter(p => p.quadrant === "star").length;
+      const dogs     = bcgData.filter(p => p.quadrant === "dog").length;
+      const cows     = bcgData.filter(p => p.quadrant === "cashcow").length;
+      const question = bcgData.filter(p => p.quadrant === "question").length;
+      const bcgScore = Math.max(0, Math.min(100, (stars * 3 + cows * 2 + question * 1) / Math.max(bcgData.length,1) * 25));
+      items.push({
+        area: "BCG Produk",
+        score: bcgScore,
+        good: stars > 0 ? `${stars} Star · ${cows} Cash Cow · ${question} Question Mark` : null,
+        bad: dogs > bcgData.length * 0.4 ? `${dogs} Dog (${(dogs/bcgData.length*100).toFixed(0)}%) — terlalu dominan` : null,
+        icon: "⭐"
+      });
+    }
+    const sh = shopeeSnap?.summary;
+    const tt = tiktokSnap?.summary;
+    const feeRate = sh?.feeRateNetGmv || tt?.feeRateNetGmv || 0;
+    const refundRate = sh?.refundRateValue || tt?.refundRateValue || 0;
+    const feeScore = feeRate > 0 ? Math.max(0, 100 - (feeRate - 15) * 5) : null;
+    if (feeScore != null) items.push({
+      area: "Fee Marketplace",
+      score: feeScore,
+      good: feeRate < 20 ? `Fee rate ${feeRate.toFixed(1)}% — efisien` : null,
+      bad: feeRate >= 25 ? `Fee rate ${feeRate.toFixed(1)}% — perlu dicek pricing` : refundRate > 3 ? `Retur ${refundRate.toFixed(1)}% — di atas normal` : null,
+      icon: "💸"
+    });
+
+    // Inventory health
+    const prods = activeProducts?.products || [];
+    if (prods.length > 0) {
+      const lowStock  = prods.filter(p => p.stock != null && p.stock < 10).length;
+      const deadStock = prods.filter(p => p.stock != null && p.stock > 60 && p.roas < (thresholds.targetRoas || 5)).length;
+      const invScore  = Math.max(0, 100 - (lowStock * 5) - (deadStock * 3));
+      items.push({
+        area: "Inventory",
+        score: invScore,
+        good: lowStock === 0 && deadStock === 0 ? "Stok semua produk aman" : null,
+        bad: lowStock > 0 ? `${lowStock} produk stok kritis (<10)` : deadStock > 0 ? `${deadStock} produk dead stock (stok tinggi, ROAS rendah)` : null,
+        icon: "📦"
+      });
+    }
+
+    // COGS/margin health
+    if (cogsItems?.length > 0) {
+      const withMargin = active.ads.filter(ad => marginFor(ad) != null).length;
+      const cogsScore  = totalAds ? (withMargin / totalAds * 100) : 0;
+      items.push({
+        area: "COGS / Margin",
+        score: cogsScore,
+        good: cogsScore >= 80 ? `${withMargin}/${totalAds} iklan terhubung ke margin` : null,
+        bad: cogsScore < 50 ? `Hanya ${withMargin}/${totalAds} iklan punya data margin — break-even tidak akurat` : null,
+        icon: "🧮"
+      });
+    }
+
+    // TikTok GMV Max
+    if (tiktokAdsSnap) {
+      const roi = tiktokAdsSnap.summary.blendedRoi;
+      const roiScore = Math.min(100, roi / 8 * 100);
+      items.push({
+        area: "TikTok GMV Max",
+        score: roiScore,
+        good: roi >= 5 ? `Blended ROI ${roi.toFixed(1)}x — healthy` : null,
+        bad: roi < 3 ? `ROI ${roi.toFixed(1)}x — di bawah threshold efisien` : null,
+        icon: "⬛"
+      });
+    }
+
+    return items;
+  }, [buckets, bcgData, active, marginFor, thresholds, activeProducts, cogsItems, shopeeSnap, tiktokSnap, tiktokAdsSnap]);
+
+  // ── 3. Prioritized action items ──
+  const actions = useMemo(() => {
+    const list = [];
+
+    if (buckets.scale.length > 0)
+      list.push({ priority: 1, level: "good", tag: "SCALE SEKARANG", desc: `${buckets.scale.length} iklan ROAS jauh di atas target — naikkan budget 20–30% atau longgarkan target ROAS GMV Max. Jangan ubah materi yang menang.`, ads: buckets.scale.slice(0,3) });
+
+    if (buckets.hold.length > 0)
+      list.push({ priority: 2, level: "bad", tag: "STOP / KETATKAN", desc: `${buckets.hold.length} iklan ROAS di bawah break-even — pause atau ketatkan target ROAS. Jangan tambah budget untuk volume di iklan rugi.`, ads: buckets.hold.slice(0,3) });
+
+    const sh = shopeeSnap?.summary;
+    if (sh?.refundRateValue > 3)
+      list.push({ priority: 3, level: "bad", tag: "AUDIT RETUR", desc: `Retur ${sh.refundRateValue.toFixed(1)}% dari GMV — di atas normal fashion 2–3%. Identifikasi SKU paling sering retur: sizing? foto tidak akurat? kualitas packaging?`, ads: [] });
+
+    if (buckets.material.length > 0)
+      list.push({ priority: 4, level: "watch", tag: "FIX MATERI IKLAN", desc: `${buckets.material.length} iklan CTR rendah — ganti thumbnail/hook. Uji 1 variasi baru per iklan sebelum scale.`, ads: buckets.material.slice(0,3) });
+
+    if (buckets.landing.length > 0)
+      list.push({ priority: 5, level: "watch", tag: "FIX HALAMAN PRODUK", desc: `${buckets.landing.length} iklan CVR rendah — bukan masalah iklan. Cek harga, foto, deskripsi, review. Jangan scale sampai CVR membaik.`, ads: buckets.landing.slice(0,3) });
+
+    const lowStock = (activeProducts?.products || []).filter(p => p.stock != null && p.stock < 10);
+    if (lowStock.length > 0)
+      list.push({ priority: 6, level: "watch", tag: "RESTOCK SEGERA", desc: `${lowStock.length} produk stok <10 unit — risiko kehabisan saat iklan jalan. Bisa ganggu algoritma GMV Max.`, ads: lowStock.slice(0,3).map(p => ({ name: p.name, roas: p.roas })) });
+
+    if (noMargin && active.ads.length > 0)
+      list.push({ priority: 7, level: "watch", tag: "INPUT COGS", desc: "Belum ada data margin — break-even ROAS tidak bisa dihitung akurat. Isi template COGS di tab COGS/Margin untuk unlock diagnosa profitabilitas.", ads: [] });
+
+    // BCG-based actions
+    if (bcgData?.length > 0) {
+      const stars   = bcgData.filter(p => p.quadrant === "star");
+      const dogs    = bcgData.filter(p => p.quadrant === "dog");
+      const cows    = bcgData.filter(p => p.quadrant === "cashcow");
+      const qs      = bcgData.filter(p => p.quadrant === "question");
+
+      if (stars.length > 0)
+        list.push({ priority: 2.5, level: "good", tag: "SCALE STAR PRODUCTS", desc: `${stars.length} produk Star (share & CVR tinggi) — prioritaskan stok dan budget iklan di sini. Ini mesin revenue utama kamu.`, ads: stars.slice(0,3).map(p => ({ name: p.name, roas: p.roas })) });
+
+      if (qs.length > 0)
+        list.push({ priority: 4.5, level: "watch", tag: "KEMBANGKAN QUESTION MARK", desc: `${qs.length} produk CVR tinggi tapi share kecil — potensi naik jadi Star. Coba naikkan exposure lewat iklan atau voucher targeted.`, ads: qs.slice(0,3).map(p => ({ name: p.name, roas: p.roas })) });
+
+      if (cows.length > 0 && cows.some(p => p.blendedCvr < 1.5))
+        list.push({ priority: 5.5, level: "watch", tag: "FIX CVR CASH COW", desc: `${cows.filter(p=>p.blendedCvr<1.5).length} Cash Cow dengan CVR rendah — share besar tapi konversi bocor. Fix foto, harga, atau deskripsi untuk unlock revenue yang tertinggal.`, ads: cows.filter(p=>p.blendedCvr<1.5).slice(0,3).map(p => ({ name: p.name, roas: p.roas })) });
+
+      if (dogs.length > dogs.length * 0 && dogs.length >= 3)
+        list.push({ priority: 8, level: "bad", tag: "AUDIT DOG PRODUCTS", desc: `${dogs.length} produk Dog (share & CVR rendah) — evaluasi: apakah masih worth di-maintain? Pertimbangkan stop iklan, clearance, atau discontinue untuk free up modal kerja.`, ads: dogs.slice(0,3).map(p => ({ name: p.name, roas: p.roas })) });
+    }
+
+    // Marketplace-specific recommendations
+    const shSum = shopeeSnap?.summary;
+    const ttSum = tiktokSnap?.summary;
+    const feeRate = shSum?.feeRateNetGmv || ttSum?.feeRateNetGmv || 0;
+    if (feeRate > 22)
+      list.push({ priority: 6.5, level: "watch", tag: "EFISIENSI FEE MARKETPLACE", desc: `Fee rate ${feeRate.toFixed(1)}% dari Net GMV — di atas rata-rata fashion. Cek: (1) proporsi voucher seller terlalu besar? (2) banyak transaksi via SPayLater yang fee-nya lebih tinggi? (3) ada iklan yang conversion-nya rendah tapi tetap jalan?`, ads: [] });
+
+    const spaylater = shopeeSnap?.orders?.filter(o => o.metodePembayaran === "SPayLater").length || 0;
+    const totalOrders = shopeeSnap?.orders?.length || 0;
+    if (totalOrders > 0 && spaylater / totalOrders > 0.3)
+      list.push({ priority: 9, level: "watch", tag: "DOMINASI SPAYLATER", desc: `${(spaylater/totalOrders*100).toFixed(0)}% pembeli pakai SPayLater — bagus untuk konversi, tapi pastikan cash flow tidak terganggu karena pelepasan dana yang lebih lambat.`, ads: [] });
+
+    return list.sort((a,b) => a.priority - b.priority);
+  }, [buckets, bcgData, shopeeSnap, tiktokSnap, activeProducts, noMargin, active, thresholds]);
+
+  const scoreColor = s => s >= 75 ? C.good : s >= 50 ? C.watch : C.bad;
+
   return (
     <div>
-      <SectionLabel>OBJECTIVE → KONDISI</SectionLabel>
-      <div style={S.stratIntro}>
-        Cocokkan objective ke kondisi iklan. Mayoritas iklanmu pakai GMV Max (target ROAS),
-        jadi "scale" = naikkan budget / longgarkan target ROAS; "hold" = ketatkan target ROAS / pause.
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 4 }}>
+        <SectionLabel>RINGKASAN STRATEGI · LINTAS TAB</SectionLabel>
+        <a href="https://wa.me/6282130311844" target="_blank" rel="noreferrer"
+          style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, color: C.accent, textDecoration: "none", padding: "6px 12px", border: `1px solid ${C.accent}`, borderRadius: 6, whiteSpace: "nowrap" }}>
+          Konsultasi →
+        </a>
       </div>
+      <div style={{ fontFamily: sans, fontSize: 12.5, color: C.muted, lineHeight: 1.6, marginBottom: 16 }}>
+        Rekapan kondisi dari semua tab — iklan, fee, inventory, COGS. Diagnosa dan saran adalah gambaran awal berbasis data; validasi dengan konteks operasional sebelum eksekusi.
+      </div>
+
+      {/* Missing data notice */}
+      {missing.length > 0 && (
+        <div style={{ background: C.watch + "12", border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
+          <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.watch, letterSpacing: 1.5, marginBottom: 8 }}>⚠ STRATEGI BELUM LENGKAP · {missing.length} DATA BELUM DIIMPORT</div>
+          <div style={{ fontFamily: sans, fontSize: 12, color: C.ink, marginBottom: 8 }}>Import data berikut untuk rekomendasi yang lebih tajam:</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {missing.map((m, i) => (
+              <div key={i} style={{ fontFamily: sans, fontSize: 11, color: C.watch, background: C.watch+"18", border: `1px solid ${C.watch}44`, borderRadius: 6, padding: "4px 10px" }}>
+                {m.icon} <b>{m.label}</b> — {m.hint}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Health scorecard */}
+      {signals.length > 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.muted, letterSpacing: 1.5, marginBottom: 10 }}>HEALTH CHECK · SEMUA AREA</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
+            {signals.map((sig, i) => (
+              <div key={i} style={{ background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${scoreColor(sig.score)}`, borderRadius: "0 8px 8px 0", padding: "12px 14px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, color: C.ink }}>{sig.icon} {sig.area}</span>
+                  <span style={{ fontFamily: mono, fontSize: 13, fontWeight: 700, color: scoreColor(sig.score) }}>{sig.score.toFixed(0)}</span>
+                </div>
+                {/* Score bar */}
+                <div style={{ height: 4, background: C.panel2, borderRadius: 2, marginBottom: 8 }}>
+                  <div style={{ width: sig.score + "%", height: "100%", background: scoreColor(sig.score), borderRadius: 2, transition: "width 0.3s" }} />
+                </div>
+                {sig.good && <div style={{ fontFamily: sans, fontSize: 11, color: C.good, lineHeight: 1.4 }}>✓ {sig.good}</div>}
+                {sig.bad  && <div style={{ fontFamily: sans, fontSize: 11, color: C.bad,  lineHeight: 1.4 }}>⚠ {sig.bad}</div>}
+                {!sig.good && !sig.bad && <div style={{ fontFamily: sans, fontSize: 11, color: C.muted }}>Data tersedia</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Prioritized action plan */}
+      <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.muted, letterSpacing: 1.5, marginBottom: 10 }}>PRIORITAS AKSI · URUT DARI PALING MENDESAK</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+        {actions.map((a, i) => (
+          <div key={i} style={{ background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${a.level === "good" ? C.good : a.level === "bad" ? C.bad : C.watch}`, borderRadius: "0 8px 8px 0", padding: "12px 16px", display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, color: C.panel, background: a.level === "good" ? C.good : a.level === "bad" ? C.bad : C.watch, borderRadius: 4, padding: "2px 7px", flexShrink: 0, marginTop: 1 }}>#{a.priority}</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, color: a.level === "good" ? C.good : a.level === "bad" ? C.bad : C.watch, marginBottom: 4 }}>{a.tag}</div>
+              <div style={{ fontFamily: sans, fontSize: 12.5, color: C.ink, lineHeight: 1.6, marginBottom: a.ads.length > 0 ? 8 : 0 }}>{a.desc}</div>
+              {a.ads.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {a.ads.map((ad, j) => (
+                    <span key={j} style={{ fontFamily: mono, fontSize: 10, color: C.muted, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 4, padding: "2px 8px" }}>
+                      {ad.name?.length > 28 ? ad.name.slice(0,28)+"…" : ad.name}
+                      {ad.roas != null && <span style={{ color: ad.roas >= (thresholds.targetRoas||5) ? C.good : C.bad }}> · {ad.roas?.toFixed(1)}x</span>}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        {actions.length === 0 && (
+          <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, padding: "20px 0", textAlign: "center" }}>Semua area terlihat sehat — tidak ada aksi mendesak saat ini.</div>
+        )}
+      </div>
+
+      {/* Ad buckets (simplified) */}
+      <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.muted, letterSpacing: 1.5, marginBottom: 10 }}>DISTRIBUSI IKLAN · {active.ads.length} TOTAL</div>
       <div style={S.stratGrid}>
-        <StratCard color={C.good} title="SCALE  -  dorong volume"
-          when="ROAS jauh di atas break-even & spend sudah signifikan"
-          action="Naikkan budget bertahap (20–30%/langkah) atau longgarkan target ROAS GMV Max. Jangan ubah materi yang sudah menang."
-          ads={buckets.scale} />
-        <StratCard color={C.bad} title="HOLD / CUT  -  lindungi margin"
-          when="ROAS di bawah break-even atau ACOS > margin"
-          action="Ketatkan target ROAS GMV Max, atau pause. Jangan tambah budget untuk 'nyari volume' di iklan rugi."
-          ads={buckets.hold} />
-        <StratCard color={C.watch} title="FIX MATERI  -  masalah atas funnel"
-          when="CTR rendah, impression cukup"
-          action="Ganti visual/hook. Objective sementara: traffic/awareness untuk uji materi baru sebelum dorong CPAS."
-          ads={buckets.material} />
-        <StratCard color={C.watch} title="FIX LANDING  -  masalah bawah funnel"
-          when="CTR oke tapi CVR rendah"
-          action="Bukan masalah iklan. Cek harga, stok, foto produk, review. Hindari scale sampai CVR membaik."
-          ads={buckets.landing} />
-        <StratCard color={C.ink} title="HEALTHY  -  biarkan jalan"
-          when="Profit, tidak ada sinyal merah"
-          action="Maintain. Pantau drift di snapshot harian."
-          ads={buckets.healthy} />
+        <StratCard color={C.good}  title="SCALE"        when="ROAS jauh di atas target & spend signifikan"          action="Naikkan budget 20–30%/langkah atau longgarkan target ROAS GMV Max." ads={buckets.scale} />
+        <StratCard color={C.bad}   title="HOLD / CUT"   when="ROAS di bawah break-even atau ACOS > margin"          action="Ketatkan target ROAS atau pause. Jangan scale iklan rugi." ads={buckets.hold} />
+        <StratCard color={C.watch} title="FIX MATERI"   when="CTR rendah, impression cukup"                         action="Ganti visual/hook. Uji 1 variasi baru sebelum dorong budget." ads={buckets.material} />
+        <StratCard color={C.watch} title="FIX LANDING"  when="CTR oke tapi CVR rendah"                              action="Cek harga, stok, foto, review. Jangan scale sebelum CVR membaik." ads={buckets.landing} />
+        <StratCard color={C.ink}   title="HEALTHY"      when="Profit, tidak ada sinyal merah"                       action="Maintain. Pantau drift di snapshot harian." ads={buckets.healthy} />
       </div>
-      {noMargin && <div style={{ ...S.cmEmpty, marginTop: 16 }}>Beberapa rekomendasi butuh margin  -  isi COGS untuk akurasi break-even.</div>}
     </div>
   );
 }
@@ -2574,7 +3081,7 @@ function ProductTab({ snap, thresholds, active, feeRate }) {
           const ad = adByCode[p.code];
           const borderCol = q.color;
           return (
-            <div key={p.code} style={{ ...S.skuCard, borderLeftColor: borderCol }}>
+            <div key={p.code} id={"sku-" + p.code} style={{ ...S.skuCard, borderLeftColor: borderCol }}>
               <div style={S.skuHead} onClick={() => setOpenCode(isOpen ? null : p.code)}>
                 <div style={S.skuHeadL}>
                   <QuadTag q={p.quadrant} />
@@ -4378,9 +4885,10 @@ function AllChannelView({ active, metaSnap, tiktokAdsSnap }) {
 /* ============================================================================
    TIKTOK GMV MAX VIEW
    ========================================================================== */
-function TikTokAdsView({ snap }) {
+function TikTokAdsView({ snap, campaignSnap, onImportCampaign }) {
   const s = snap.summary;
   const daily = snap.daily.filter(d => d.tgl && d.tgl !== "-");
+  const [openCamp, setOpenCamp] = useState(null);
 
   // ROI trend — 7-day moving avg
   const trend = useMemo(() => {
@@ -4413,38 +4921,77 @@ function TikTokAdsView({ snap }) {
   const best3  = sorted.slice(0,3);
   const worst3 = sorted.slice(-3).reverse();
 
-  // Diagnosa
+  // Diagnosa — gabungan daily + campaign file
   const diagnosa = useMemo(() => {
     const items = [];
     const roi = s.blendedRoi;
-    const avgDailySpend = daily.length ? s.totalSpend / daily.length : 0;
     const roiVariance = daily.filter(d=>d.roi>0).reduce((t,d) => t + Math.pow(d.roi - s.avgRoi, 2), 0) / Math.max(daily.filter(d=>d.roi>0).length-1, 1);
     const roiStdDev = Math.sqrt(roiVariance);
 
+    // ── Daily: ROI overall ──
     if (roi >= 8) {
-      items.push({ level: "good", tag: "ROI EXCELLENT", msg: `Blended ROI ${roi.toFixed(2)}x — sangat efisien untuk GMV Max. Di atas 8x berarti setiap Rp 1 spend menghasilkan Rp ${roi.toFixed(1)} GMV. Pertahankan budget range sekarang dan pantau apakah ada tanda-tanda diminishing return (ROI mulai turun saat budget naik).` });
+      items.push({ level: "good", tag: "ROI EXCELLENT", msg: `Blended ROI ${roi.toFixed(2)}x — sangat efisien. Di atas 8x berarti setiap Rp 1 spend → Rp ${roi.toFixed(1)} GMV. Pertahankan budget dan pantau tanda diminishing return.` });
     } else if (roi >= 5) {
-      items.push({ level: "good", tag: "ROI BAIK", msg: `Blended ROI ${roi.toFixed(2)}x — healthy untuk GMV Max. GMV Max di fashion Indonesia yang sehat biasanya 4–8x. Masih ada ruang untuk scale budget 20–30% sambil pantau ROI tidak drop di bawah 4x.` });
+      items.push({ level: "good", tag: "ROI BAIK", msg: `Blended ROI ${roi.toFixed(2)}x — healthy (benchmark fashion 4–8x). Masih ada ruang scale 20–30% sambil pantau ROI tidak drop di bawah 4x.` });
     } else if (roi >= 3) {
-      items.push({ level: "watch", tag: "ROI MODERAT", msg: `Blended ROI ${roi.toFixed(2)}x — acceptable tapi belum optimal. Untuk GMV Max fashion, target minimal 4–5x. Cek: apakah semua produk aktif di katalog? Produk dengan harga tinggi dan margin bagus biasanya di-prefer algoritma GMV Max.` });
+      items.push({ level: "watch", tag: "ROI MODERAT", msg: `Blended ROI ${roi.toFixed(2)}x — acceptable tapi belum optimal. Target minimal 4–5x. Cek kelengkapan katalog dan apakah produk margin tinggi sudah aktif.` });
     } else {
-      items.push({ level: "bad", tag: "ROI RENDAH", msg: `Blended ROI ${roi.toFixed(2)}x — di bawah threshold efisien. Pertimbangkan kurangi budget GMV Max dan alihkan ke campaign manual yang lebih bisa dikontrol targetingnya. GMV Max yang ROI-nya rendah biasanya indikasi katalog produk perlu di-refresh atau harga tidak kompetitif.` });
+      items.push({ level: "bad", tag: "ROI RENDAH", msg: `Blended ROI ${roi.toFixed(2)}x — di bawah threshold. Pertimbangkan kurangi budget GMV Max, alihkan ke manual. ROI rendah biasanya indikasi katalog perlu refresh atau harga tidak kompetitif.` });
     }
 
+    // ── Daily: konsistensi ──
     if (roiStdDev > 2) {
-      items.push({ level: "watch", tag: "ROI TIDAK STABIL", msg: `Standar deviasi ROI harian ${roiStdDev.toFixed(1)} — fluktuasi tinggi. Hari terbaik ROI ${best3[0]?.roi.toFixed(1)}x, hari terburuk ${worst3[0]?.roi.toFixed(1)}x. Fluktuasi ekstrem biasanya karena: flash sale / promo hari tertentu, stok SKU tertentu habis di tengah bulan, atau algoritma GMV Max sedang dalam fase learning ulang.` });
+      items.push({ level: "watch", tag: "ROI TIDAK STABIL", msg: `Deviasi ROI harian ${roiStdDev.toFixed(1)} — fluktuasi tinggi. Terbaik ${best3[0]?.roi.toFixed(1)}x, terburuk ${worst3[0]?.roi.toFixed(1)}x. Penyebab umum: flash sale, stok SKU habis di tengah bulan, atau algoritma dalam fase learning ulang.` });
     } else {
-      items.push({ level: "good", tag: "ROI KONSISTEN", msg: `Standar deviasi ROI ${roiStdDev.toFixed(1)} — performa stabil. GMV Max sudah out of learning phase dan deliver secara konsisten. Ini tanda algoritma sudah matang dengan katalog dan budget kamu.` });
+      items.push({ level: "good", tag: "ROI KONSISTEN", msg: `Deviasi ROI ${roiStdDev.toFixed(1)} — stabil. Algoritma GMV Max sudah matang dengan katalog dan budget sekarang.` });
     }
 
     if (s.avgCpa > 75000) {
-      items.push({ level: "watch", tag: "CPA TINGGI", msg: `Rata-rata CPA Rp ${s.avgCpa.toLocaleString("id-ID")} per order — relatif tinggi. Cek apakah GMV Max mendorong produk yang AOV-nya tinggi (wajar CPA-nya tinggi) atau malah produk entry-level yang margin tipis. CPA yang ideal = di bawah 10% dari AOV.` });
+      items.push({ level: "watch", tag: "CPA TINGGI", msg: `Rata-rata CPA Rp ${s.avgCpa.toLocaleString("id-ID")} — cek apakah GMV Max mendorong produk AOV tinggi (wajar) atau entry-level margin tipis (masalah). CPA ideal = di bawah 10% dari AOV.` });
     }
 
-    items.push({ level: "neutral", tag: "KONTEKS GMV MAX", msg: "GMV Max adalah automated campaign — algoritma TikTok yang decide produk, audience, dan placement. Tidak bisa dioptimasi pada level creative atau targeting. Lever yang tersedia: (1) budget harian, (2) kelengkapan dan kualitas katalog produk, (3) harga kompetitif produk di katalog, (4) stok yang cukup agar algoritma tidak switch ke produk lain." });
+    // ── Cross-file: campaign insights ──
+    if (campaignSnap?.campaigns?.length > 0) {
+      const camps = campaignSnap.campaigns;
+      const totalCampSpend = camps.reduce((t,c) => t+c.spend, 0);
+
+      const winners  = camps.filter(c => c.roi >= roi * 1.2 && c.spend > 0);
+      const draggers = camps.filter(c => c.roi > 0 && c.roi < roi * 0.6 && c.spend > totalCampSpend * 0.05);
+      const topByGmv = [...camps].sort((a,b) => b.gmv - a.gmv)[0];
+
+      if (winners.length > 0)
+        items.push({ level: "good", tag: "KAMPANYE TERBAIK", msg: `${winners.length} kampanye ROI di atas rata-rata: ${winners.slice(0,3).map(c=>`"${c.name.slice(0,22)}" ${c.roi.toFixed(1)}x`).join(" · ")}. Prioritaskan stok produk di kampanye ini.` });
+
+      if (draggers.length > 0) {
+        const dragSpend = draggers.reduce((t,c) => t+c.spend, 0);
+        items.push({ level: "bad", tag: "KAMPANYE DRAG ROI", msg: `${draggers.length} kampanye ROI jauh di bawah rata-rata: ${draggers.slice(0,2).map(c=>`"${c.name.slice(0,22)}" ${c.roi.toFixed(1)}x`).join(" · ")} — menyerap ${rpShort(dragSpend)} spend. Ketatkan target ROI atau pause untuk naikkan blended ROI.` });
+      }
+
+      if (topByGmv) {
+        const topShare = topByGmv.gmv / (campaignSnap.summary.totalGmv || 1) * 100;
+        if (topShare > 60)
+          items.push({ level: "watch", tag: "KONSENTRASI GMV TINGGI", msg: `Kampanye "${topByGmv.name.slice(0,30)}" menghasilkan ${topShare.toFixed(0)}% GMV TikTok. Dependensi tinggi — kalau kampanye ini drop, impact besar. Kembangkan kampanye lain sebagai backup.` });
+      }
+
+      const lowCtr = camps.filter(c => c.ctr > 0 && c.ctr < 1 && c.spend > totalCampSpend * 0.05);
+      if (lowCtr.length > 0)
+        items.push({ level: "watch", tag: "CTR RENDAH", msg: `${lowCtr.length} kampanye CTR di bawah 1%: ${lowCtr.slice(0,2).map(c=>`"${c.name.slice(0,20)}" ${c.ctr.toFixed(2)}%`).join(", ")}. Refresh visual atau hook opening video.` });
+
+      const lowCvr = camps.filter(c => c.cvr > 0 && c.cvr < 1 && c.spend > totalCampSpend * 0.05);
+      if (lowCvr.length > 0)
+        items.push({ level: "watch", tag: "CVR RENDAH", msg: `${lowCvr.length} kampanye CVR di bawah 1%: ${lowCvr.slice(0,2).map(c=>`"${c.name.slice(0,20)}" ${c.cvr.toFixed(2)}%`).join(", ")}. Masalah listing bukan iklan — cek harga, foto, ulasan produk.` });
+
+      // Validasi konsistensi spend antar dua file
+      const gapPct = campaignSnap.summary.totalSpend > 0 && s.totalSpend > 0
+        ? Math.abs(campaignSnap.summary.totalSpend - s.totalSpend) / s.totalSpend * 100 : 0;
+      if (gapPct > 15)
+        items.push({ level: "watch", tag: "GAP DATA ANTAR FILE", msg: `Spend GMV Max harian (${rpShort(s.totalSpend)}) vs Campaign Report (${rpShort(campaignSnap.summary.totalSpend)}) selisih ${gapPct.toFixed(0)}%. Pastikan kedua file menggunakan periode yang sama.` });
+    }
+
+    items.push({ level: "neutral", tag: "KONTEKS GMV MAX", msg: "Lever optimasi GMV Max: (1) budget harian, (2) kelengkapan & kualitas katalog, (3) harga kompetitif, (4) stok cukup agar algoritma tidak switch ke produk lain. Tidak bisa dioptimasi di level creative atau targeting." });
 
     return items;
-  }, [s, daily, best3, worst3]);
+  }, [s, daily, best3, worst3, campaignSnap]);
 
   const maxGmv = Math.max(...daily.map(d => d.gmv), 1);
 
@@ -4462,25 +5009,72 @@ function TikTokAdsView({ snap }) {
         <Kpi label="Avg Daily ROI" value={s.avgRoi.toFixed(2)+"x"} dir="rev" accent={C.muted} />
       </div>
 
-      {/* Daily GMV bar chart */}
-      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px", marginTop: 12 }}>
-        <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, marginBottom: 12 }}>GMV HARIAN</div>
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 80 }}>
-          {daily.map((d, i) => {
-            const h = Math.max(4, (d.gmv / maxGmv) * 76);
-            const col = d.roi >= 7 ? C.good : d.roi >= 4 ? C.accent : d.roi >= 2 ? C.watch : C.bad;
-            return (
-              <div key={i} title={`${d.tgl}: GMV ${rpShort(d.gmv)} · ROI ${d.roi.toFixed(1)}x`}
-                style={{ flex: 1, height: h, background: col, borderRadius: 2, minWidth: 2, cursor: "default", opacity: 0.85 }} />
-            );
-          })}
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontFamily: mono, fontSize: 10, color: C.dim }}>
-          <span>{daily[0]?.tgl?.slice(5)}</span>
-          <span style={{ color: C.muted }}>warna = ROI (hijau ≥7x · biru ≥4x · kuning ≥2x · merah &lt;2x)</span>
-          <span>{daily[daily.length-1]?.tgl?.slice(5)}</span>
-        </div>
-      </div>
+      {/* Dual-line chart: Biaya vs Pesanan harian */}
+      {daily.length > 1 && (() => {
+        const W = 700, H = 160, padL = 52, padR = 16, padT = 12, padB = 28;
+        const maxSpend  = Math.max(...daily.map(d => d.spend), 1);
+        const maxOrders = Math.max(...daily.map(d => d.orders), 1);
+        const xOf = i => padL + (i / Math.max(daily.length - 1, 1)) * (W - padL - padR);
+        const ySpend  = v => padT + (1 - v / maxSpend)  * (H - padT - padB);
+        const yOrders = v => padT + (1 - v / maxOrders) * (H - padT - padB);
+        const spendPts  = daily.map((d,i) => `${xOf(i)},${ySpend(d.spend)}`).join(" ");
+        const orderPts  = daily.map((d,i) => `${xOf(i)},${yOrders(d.orders)}`).join(" ");
+        const spendArea = `${xOf(0)},${H-padB} ` + spendPts + ` ${xOf(daily.length-1)},${H-padB}`;
+        // Y-axis ticks (spend)
+        const yTicks = [0, 0.5, 1].map(r => ({ v: maxSpend * r, y: ySpend(maxSpend * r) }));
+        // Date ticks — show ~5 evenly
+        const step = Math.max(1, Math.floor(daily.length / 5));
+        const dateTicks = daily.filter((_, i) => i % step === 0 || i === daily.length - 1);
+        return (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "16px 18px", marginTop: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1.2 }}>BIAYA & PESANAN HARIAN</div>
+              <div style={{ display: "flex", gap: 16 }}>
+                {[["#1dd3b0", "Biaya"], ["#f5a623", "Pesanan SKU"]].map(([c, l]) => (
+                  <div key={l} style={{ display: "flex", alignItems: "center", gap: 5, fontFamily: mono, fontSize: 10, color: C.muted }}>
+                    <div style={{ width: 20, height: 2.5, background: c, borderRadius: 2 }} />{l}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", overflow: "visible" }}>
+              {/* Grid lines */}
+              {yTicks.map((t, i) => (
+                <g key={i}>
+                  <line x1={padL} x2={W - padR} y1={t.y} y2={t.y} stroke={C.line} strokeWidth="0.5" strokeDasharray="3,3" />
+                  <text x={padL - 4} y={t.y + 3.5} textAnchor="end" fontSize="8" fill={C.dim} fontFamily="monospace">{rpShort(t.v)}</text>
+                </g>
+              ))}
+              {/* Date ticks */}
+              {dateTicks.map((d, i) => {
+                const idx = daily.indexOf(d);
+                return <text key={i} x={xOf(idx)} y={H - 4} textAnchor="middle" fontSize="8" fill={C.dim} fontFamily="monospace">{d.tgl?.slice(5)}</text>;
+              })}
+              {/* Spend area fill */}
+              <polygon points={spendArea} fill="#1dd3b0" fillOpacity="0.08" />
+              {/* Spend line */}
+              <polyline points={spendPts} fill="none" stroke="#1dd3b0" strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
+              {/* Orders line (right axis scale) */}
+              <polyline points={orderPts} fill="none" stroke="#f5a623" strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" strokeDasharray="0" />
+              {/* Right axis ticks (orders) */}
+              {[0, 0.5, 1].map((r, i) => (
+                <text key={i} x={W - padR + 4} y={yOrders(maxOrders * r) + 3.5} textAnchor="start" fontSize="8" fill={C.dim} fontFamily="monospace">{Math.round(maxOrders * r)}</text>
+              ))}
+              {/* Hover dots on data points */}
+              {daily.map((d, i) => (
+                <circle key={i} cx={xOf(i)} cy={ySpend(d.spend)} r="2.5" fill="#1dd3b0" fillOpacity="0.7" stroke="none">
+                  <title>{`${d.tgl} · Biaya ${rpShort(d.spend)} · Pesanan ${d.orders} · ROI ${d.roi.toFixed(1)}x`}</title>
+                </circle>
+              ))}
+              {daily.map((d, i) => (
+                <circle key={`o${i}`} cx={xOf(i)} cy={yOrders(d.orders)} r="2.5" fill="#f5a623" fillOpacity="0.7" stroke="none">
+                  <title>{`${d.tgl} · Pesanan ${d.orders} · ROI ${d.roi.toFixed(1)}x`}</title>
+                </circle>
+              ))}
+            </svg>
+          </div>
+        );
+      })()}
 
       {/* Weekly table */}
       <div style={{ marginTop: 12 }}>
@@ -4535,6 +5129,95 @@ function TikTokAdsView({ snap }) {
         </div>
       </div>
 
+      {/* Per-campaign table */}
+      {campaignSnap ? (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <SectionLabel>PER KAMPANYE · {campaignSnap.summary.campaignCount} kampanye · {nfmt(campaignSnap.summary.totalOrders)} orders</SectionLabel>
+          </div>
+          <div style={S.tableWrap}>
+                <table style={S.table}>
+                  <thead><tr>
+                    <th style={{ ...S.th, width: 18 }}></th>
+                    <th style={S.th}>Kampanye</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>Spend</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>GMV</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>ROI</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>Orders</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>Impresi</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>CTR</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>CVR</th>
+                    <th style={{ ...S.th, textAlign: "right" }}>CPA</th>
+                  </tr></thead>
+                  <tbody>
+                    {campaignSnap.campaigns.map((c, i) => {
+                      const roiCol = c.roi >= 7 ? C.good : c.roi >= 4 ? C.accent : c.roi >= 2 ? C.watch : C.bad;
+                      const cpa = c.orders > 0 ? c.spend / c.orders : 0;
+                      const isOpen = openCamp === i;
+                      return (
+                        <React.Fragment key={i}>
+                          <tr style={{ ...S.tr, cursor: "pointer" }} onClick={() => setOpenCamp(isOpen ? null : i)}>
+                            <td style={{ ...S.td, color: C.muted, fontFamily: mono, fontSize: 11 }}>{isOpen ? "▾" : "▸"}</td>
+                            <td style={S.td}>
+                              <div style={{ fontFamily: sans, fontSize: 12.5, fontWeight: 600, color: C.ink }}>{c.name}</div>
+                              <div style={{ fontFamily: sans, fontSize: 11, color: C.dim }}>{c.products.length} creative/produk</div>
+                            </td>
+                            <td style={{ ...S.tdR, color: C.watch }}>{rpShort(c.spend)}</td>
+                            <td style={{ ...S.tdR, color: C.accent }}>{rpShort(c.gmv)}</td>
+                            <td style={{ ...S.tdR, fontWeight: 700, color: roiCol }}>{c.roi.toFixed(2)}x</td>
+                            <td style={S.tdR}>{nfmt(c.orders)}</td>
+                            <td style={{ ...S.tdR, color: C.muted }}>{c.impr > 0 ? nfmt(c.impr) : "—"}</td>
+                            <td style={{ ...S.tdR, color: c.ctr > 0 && c.ctr < 1 ? C.watch : C.ink }}>{c.ctr > 0 ? c.ctr.toFixed(2)+"%" : "—"}</td>
+                            <td style={{ ...S.tdR, color: c.cvr > 0 && c.cvr < 1 ? C.watch : C.ink }}>{c.cvr > 0 ? c.cvr.toFixed(2)+"%" : "—"}</td>
+                            <td style={{ ...S.tdR, color: C.muted }}>{rpShort(cpa)}</td>
+                          </tr>
+                          {isOpen && (
+                            <tr style={S.diagRow}>
+                              <td></td>
+                              <td colSpan={9} style={{ ...S.diagCell, padding: "10px 12px" }}>
+                                <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, letterSpacing: 1.2, marginBottom: 8 }}>DETAIL CREATIVE / PRODUK · TOP 5</div>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 8 }}>
+                                  {[...c.products].sort((a,b) => b.gmv - a.gmv).slice(0,5).map((p, j) => {
+                                    const pRoiCol = p.roi >= 7 ? C.good : p.roi >= 4 ? C.accent : p.roi >= 2 ? C.watch : C.bad;
+                                    return (
+                                      <div key={j} style={{ background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${pRoiCol}`, borderRadius: "0 6px 6px 0", padding: "8px 10px" }}>
+                                        <div style={{ fontFamily: mono, fontSize: 10, color: C.dim, marginBottom: 4 }}>{p.prodId || `#${j+1}`}</div>
+                                        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                                          <span style={{ fontFamily: mono, fontSize: 11, color: C.watch }}>Rp{rpShort(p.spend)}</span>
+                                          <span style={{ fontFamily: mono, fontSize: 11, color: C.accent }}>{rpShort(p.gmv)}</span>
+                                          <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, color: pRoiCol }}>{p.roi.toFixed(1)}x</span>
+                                          {p.ctr > 0 && <span style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>CTR {p.ctr.toFixed(2)}%</span>}
+                                          {p.cvr > 0 && <span style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>CVR {p.cvr.toFixed(2)}%</span>}
+                                          {p.orders > 0 && <span style={{ fontFamily: mono, fontSize: 11, color: C.good }}>{p.orders} order</span>}
+                                        </div>
+                                        {p.status && <div style={{ fontFamily: sans, fontSize: 10, color: C.dim, marginTop: 4 }}>{p.status}</div>}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+        </div>
+      ) : (
+        <div style={{ marginTop: 16, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontFamily: sans, fontSize: 12.5, fontWeight: 700, color: C.ink, marginBottom: 3 }}>📊 Data Per Kampanye belum diimport</div>
+            <div style={{ fontFamily: sans, fontSize: 12, color: C.muted }}>TikTok Ads Manager → Pelaporan → Produk → Materi Iklan Produk → pilih periode → Ekspor</div>
+          </div>
+          <button onClick={onImportCampaign} style={{ fontFamily: mono, fontSize: 12, fontWeight: 700, color: "#fff", background: "#fe2c55", border: "none", borderRadius: 7, padding: "9px 16px", cursor: "pointer", flexShrink: 0, marginLeft: 16 }}>
+            + Import Campaign
+          </button>
+        </div>
+      )}
+
+
       {/* Diagnosa */}
       <div style={{ marginTop: 12 }}>
         <SectionLabel>DIAGNOSA &amp; SARAN</SectionLabel>
@@ -4545,6 +5228,7 @@ function TikTokAdsView({ snap }) {
           </div>
         ))}
       </div>
+
     </div>
   );
 }
@@ -4843,12 +5527,16 @@ function BCGScatter({ classified, onPick, openCode }) {
     return Math.max(s[Math.floor(s.length / 2)] || 0, meanShare * 1.5, 2);
   })();
   const cvrCut = (() => {
-    const c = classified.map((p) => p.cvr).filter((x) => x > 0).sort((a, b) => a - b);
+    const c = classified.map((p) => p.blendedCvr || p.cvr).filter((x) => x > 0).sort((a, b) => a - b);
     return Math.max(c[Math.floor(c.length / 2)] || 0, 0.8);
   })();
   const sx = (share) => pad + (Math.sqrt(share) / Math.sqrt(maxShare)) * (W - pad * 2);
   const sy = (cvr) => H - pad - (cvr / maxCvr) * (H - pad * 2);
   const cutX = sx(shareCut), cutY = sy(cvrCut);
+
+  // Tooltip state
+  const [hovered, setHovered] = React.useState(null);
+
   return (
     <div style={S.scatterWrap}>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
@@ -4871,17 +5559,49 @@ function BCGScatter({ classified, onPick, openCode }) {
         {/* axis titles */}
         <text x={W / 2} y={H - 10} textAnchor="middle" fill={C.muted} fontSize="11" fontFamily={mono}>revenue share →</text>
         <text x={14} y={H / 2} textAnchor="middle" fill={C.muted} fontSize="11" fontFamily={mono} transform={`rotate(-90 14 ${H / 2})`}>CVR produk →</text>
-        {/* points */}
+        {/* points — use blendedCvr for position */}
         {classified.map((p) => {
+          const cvr = p.blendedCvr || p.cvr;
           const r = Math.max(4, Math.min(16, Math.sqrt(p.netSales || p.sales) / 700));
           const q = QUAD[p.quadrant];
           const on = openCode === p.code;
+          const hov = hovered === p.code;
+          const x = sx(p.share), y = sy(cvr);
           return (
-            <circle key={p.code} cx={sx(p.share)} cy={sy(p.cvr)} r={on ? r + 3 : r}
-              fill={q.color} opacity={on ? 0.95 : 0.6} stroke={on ? "#fff" : q.color} strokeWidth={on ? 2 : 1}
-              style={{ cursor: "pointer" }} onClick={() => onPick(p.code)}>
-              <title>{p.name} · share {p.share.toFixed(1)}% · CVR {p.cvr.toFixed(2)}%</title>
-            </circle>
+            <g key={p.code}
+              style={{ cursor: "pointer" }}
+              onClick={() => {
+                onPick(p.code);
+                // Scroll to SKU card
+                setTimeout(() => {
+                  const el = document.getElementById("sku-" + p.code);
+                  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                }, 60);
+              }}
+              onMouseEnter={() => setHovered(p.code)}
+              onMouseLeave={() => setHovered(null)}>
+              <circle cx={x} cy={y} r={on ? r + 4 : hov ? r + 2 : r}
+                fill={q.color} opacity={on ? 1 : hov ? 0.85 : 0.6}
+                stroke={on ? "#fff" : hov ? q.color : q.color}
+                strokeWidth={on ? 2.5 : hov ? 1.5 : 0.5} />
+              {/* Name label on hover or selected */}
+              {(hov || on) && (() => {
+                const name = p.name.length > 22 ? p.name.slice(0,22)+"…" : p.name;
+                const lx = x + r + 6;
+                const anchor = lx + name.length * 5.5 > W - 10 ? "end" : "start";
+                const lxAdj = anchor === "end" ? x - r - 6 : lx;
+                return (
+                  <g>
+                    <rect x={lxAdj - 3} y={y - 9} width={name.length * 5.8 + 8} height={14}
+                      fill={C.panel} opacity="0.88" rx="3" />
+                    <text x={lxAdj} y={y + 2} textAnchor={anchor === "end" ? "end" : "start"}
+                      fontSize="9.5" fontFamily={mono} fill={q.color} fontWeight="700">
+                      {name}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
           );
         })}
       </svg>
