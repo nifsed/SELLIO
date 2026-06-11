@@ -37,6 +37,7 @@ function openDB() {
         db.createObjectStore("meta_ads", { keyPath: "id" }); // Meta Ads snapshots
       if (!db.objectStoreNames.contains("tiktok_ads"))
         db.createObjectStore("tiktok_ads", { keyPath: "id" }); // TikTok Ads (GMV Max) snapshots
+      if (!db.objectStoreNames.contains("tiktok_campaign"))
         db.createObjectStore("tiktok_campaign", { keyPath: "id" }); // TikTok per-campaign/product
       if (!db.objectStoreNames.contains("pnl_inputs"))
         db.createObjectStore("pnl_inputs", { keyPath: "key" }); // P&L manual inputs
