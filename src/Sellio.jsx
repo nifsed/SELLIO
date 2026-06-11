@@ -9,7 +9,7 @@ import * as XLSX from "xlsx";
 
 /* ---------- IndexedDB (no deps) ------------------------------------------ */
 const DB_NAME = "sellio";
-const DB_VER = 13;
+const DB_VER = 14;
 function openDB() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(DB_NAME, DB_VER);
