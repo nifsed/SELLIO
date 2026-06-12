@@ -1308,54 +1308,47 @@ export default function Nolkoma() {
   async function exportPDF() {
     if (licenseStatus !== "pro") { setShowUpgradeModal(true); return; }
     setExporting(true);
-    showToast("Menyiapkan PDF...");
+    showToast("Menyiapkan PDF — gunakan Save as PDF di dialog print...");
     try {
-      // Load via script tag — works in both Vercel and browser environments
-      await new Promise((res, rej) => {
-        if (window.html2canvas) return res();
-        const s = document.createElement("script");
-        s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
-        s.onload = res; s.onerror = rej;
-        document.head.appendChild(s);
-      });
-      await new Promise((res, rej) => {
-        if (window.jspdf) return res();
-        const s = document.createElement("script");
-        s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
-        s.onload = res; s.onerror = rej;
-        document.head.appendChild(s);
-      });
-      const html2canvas = window.html2canvas;
-      const { jsPDF } = window.jspdf;
-      const el = document.getElementById("nolkoma-main-content");
-      if (!el) { showToast("Gagal export — konten tidak ditemukan."); setExporting(false); return; }
-      const canvas = await html2canvas(el, { scale: 1.5, useCORS: true, backgroundColor: "#F8F8FC", logging: false });
-      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-      const pageW = pdf.internal.pageSize.getWidth();
-      const pageH = pdf.internal.pageSize.getHeight();
-      const margin = 10;
-      const imgW = pageW - margin * 2;
-      const totalImgH = (canvas.height * imgW) / canvas.width;
-      const sliceHeightPx = Math.floor((pageH - margin * 2) / totalImgH * canvas.height);
-      let offsetY = 0; let pageNum = 0;
-      while (offsetY < canvas.height) {
-        const h = Math.min(sliceHeightPx, canvas.height - offsetY);
-        const sliceCanvas = document.createElement("canvas");
-        sliceCanvas.width = canvas.width; sliceCanvas.height = h;
-        sliceCanvas.getContext("2d").drawImage(canvas, 0, offsetY, canvas.width, h, 0, 0, canvas.width, h);
-        const sliceImgH = (h * imgW) / canvas.width;
-        if (pageNum > 0) pdf.addPage();
-        pdf.addImage(sliceCanvas.toDataURL("image/jpeg", 0.92), "JPEG", margin, margin, imgW, sliceImgH);
-        pdf.setFontSize(7); pdf.setTextColor(160, 160, 190);
-        pdf.text("nolkoma.com", pageW - margin, pageH - 4, { align: "right" });
-        offsetY += h; pageNum++;
-      }
-      const tabLabel = { overview:"Overview", strategy:"Strategi", fee:"Fee Marketplace", performance:"Performa Iklan", product:"Performa Produk", area:"Peta Distribusi", inventory:"Inventory", forecast:"Forecast", cogs:"COGS", unitec:"Unit Economics", cm:"Contribution Margin", pnl:"Simulasi LR" }[tab] || tab;
-      pdf.save(`Nolkoma_${tabLabel}_${new Date().toISOString().slice(0,10)}.pdf`);
-      showToast("PDF berhasil diexport.");
+      // Add print styles
+      const style = document.createElement("style");
+      style.id = "nolkoma-print-style";
+      style.textContent = `
+        @media print {
+          body > * { display: none !important; }
+          #nolkoma-print-area { display: block !important; }
+          #nolkoma-print-area::after {
+            content: "nolkoma.com";
+            display: block;
+            text-align: right;
+            font-size: 9px;
+            color: #aaa;
+            margin-top: 16px;
+          }
+        }
+        #nolkoma-print-area { display: none; }
+      `;
+      document.head.appendChild(style);
+
+      // Clone main content into print area
+      const src = document.getElementById("nolkoma-main-content");
+      let printDiv = document.getElementById("nolkoma-print-area");
+      if (!printDiv) { printDiv = document.createElement("div"); printDiv.id = "nolkoma-print-area"; document.body.appendChild(printDiv); }
+      printDiv.innerHTML = src ? src.innerHTML : "";
+
+      setTimeout(() => {
+        window.print();
+        setTimeout(() => {
+          const s = document.getElementById("nolkoma-print-style");
+          if (s) s.remove();
+          if (printDiv) printDiv.innerHTML = "";
+          setExporting(false);
+        }, 1000);
+      }, 300);
     } catch(e) {
-      showToast("Gagal export: " + (e.message || "unknown error"));
-    } finally { setExporting(false); }
+      showToast("Gagal export: " + e.message);
+      setExporting(false);
+    }
   }
 
   // Generate fingerprint from browser characteristics
