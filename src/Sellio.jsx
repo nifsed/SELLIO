@@ -1392,8 +1392,8 @@ export default function Nolkoma() {
   const [trialDaysLeft, setTrialDaysLeft] = useState(null);
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const TRIAL_DAYS = 2;
-  const LYNK_MONTHLY = "https://lynk.id/hanifmhu/s/nolkoma-pro-bulanan";
-  const LYNK_LIFETIME = "https://lynk.id/hanifmhu/s/nolkoma-pro-selamanya";
+  const LYNK_MONTHLY = "https://lynk.id/hanif.mhu/jpy8nqwvz5oe";
+  const LYNK_LIFETIME = "https://lynk.id/hanif.mhu/x7oqr60p2ydd";
   const [industry, setIndustry] = useState("fashion");
   const [showIndustryPicker, setShowIndustryPicker] = useState(false);
   const industryPreset = INDUSTRY_PRESETS[industry] || INDUSTRY_PRESETS.fashion;
@@ -2192,7 +2192,40 @@ function parseOrderXlsx(buf) {
         </>}
       </main>
 
-      {toast && <div style={S.toast}>{toast}</div>}
+      {/* Footer */}
+      <footer data-noprint style={{ background: C.ink, padding: "32px 40px 24px", marginTop: 40 }}>
+        <div style={{ maxWidth: 900, margin: "0 auto" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 32, flexWrap: "wrap", marginBottom: 24 }}>
+            <div>
+              <div style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 6 }}>NOLKOMA</div>
+              <div style={{ fontFamily: sans, fontSize: 12, color: "#94A3B8", lineHeight: 1.7, maxWidth: 320 }}>
+                Data kamu, keputusan kamu. Nolkoma hanya menyajikan angka — sisanya ada di tangan kamu.<br/>
+                <span style={{ color: "#475569", fontSize: 11 }}>Data 100% dari file ekspor resmi platform. Tidak ada yang tersimpan di server kami.</span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 1.2, marginBottom: 10 }}>KONTAK</div>
+              <a href="https://wa.me/6282130311844" target="_blank" rel="noreferrer"
+                style={{ fontFamily: sans, fontSize: 12, color: "#818CF8", textDecoration: "none", display: "block", marginBottom: 4 }}>
+                WhatsApp: 082130311844
+              </a>
+              <a href="https://nolkoma.com" target="_blank" rel="noreferrer"
+                style={{ fontFamily: sans, fontSize: 12, color: "#818CF8", textDecoration: "none" }}>
+                nolkoma.com
+              </a>
+            </div>
+          </div>
+          <div style={{ borderTop: "1px solid #1E293B", paddingTop: 20 }}>
+            <div style={{ fontFamily: sans, fontSize: 11, color: "#475569", lineHeight: 1.8, marginBottom: 12 }}>
+              <span style={{ fontWeight: 700, color: "#64748B" }}>Disclaimer: </span>
+              Nolkoma menyajikan data langsung dari file ekspor resmi marketplace tanpa modifikasi. Rekomendasi dan diagnosa yang ditampilkan bersifat panduan berbasis benchmark umum — bukan saran keuangan, operasional, atau bisnis yang bersifat final. Validasi dengan kondisi bisnis kamu sebelum mengambil keputusan. Nolkoma tidak bertanggung jawab atas kerugian yang timbul dari keputusan berdasarkan data di platform ini.
+            </div>
+            <div style={{ fontFamily: sans, fontSize: 11, color: "#334155" }}>
+              © 2026 Nolkoma
+            </div>
+          </div>
+        </div>
+      </footer>
 
       {/* Custom confirm dialog (replaces window.confirm which is blocked in iframes) */}
       {confirmDlg && (
