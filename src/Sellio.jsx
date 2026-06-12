@@ -2007,7 +2007,7 @@ function parseOrderXlsx(buf) {
 
       {/* tabs */}
       <nav data-noprint style={S.tabs}>
-        {[["overview", "Overview"], ["strategy", "Strategi"], ["fee", "Fee Marketplace"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Inventory"], ["forecast", "Forecast & Stok"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
+        {[["overview", "Overview"], ["strategy", "Strategi"], ["fee", "Fee Marketplace"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Analisa Inventory"], ["forecast", "Forecast Target"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
           <button key={k} onClick={() => setTab(k)}
             style={{ ...S.tab, ...(tab === k ? S.tabActive : {}) }}>{lbl}</button>
         ))}
@@ -4104,7 +4104,7 @@ function UpgradeModal({ onActivate, lynkMonthly, lynkLifetime, onClose }) {
 
         {/* Konsultasi note */}
         <div style={{ background: C.panel2, borderRadius: 8, padding: "10px 14px", marginBottom: 20, fontFamily: sans, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
-          💬 Butuh bantuan analisa data kamu? <span style={{ color: C.accent, fontWeight: 600 }}>Konsultasi 1 sesi — Rp 500.000</span> via WhatsApp. Bahas ROAS, fee, inventory, strategi scaling.
+          💬 Butuh bantuan analisa data kamu? <a href="https://wa.me/6282130311844?text=Halo%2C%20saya%20mau%20konsultasi%20Nolkoma%20Pro" target="_blank" rel="noreferrer" style={{ color: C.accent, fontWeight: 600, textDecoration: "none" }}>Konsultasi 1 sesi — Rp 500.000</a> via WhatsApp. Bahas ROAS, fee, inventory, strategi scaling.
         </div>
 
         {/* Divider */}
@@ -4129,8 +4129,9 @@ function UpgradeModal({ onActivate, lynkMonthly, lynkLifetime, onClose }) {
           </button>
         </div>
         {keyError && <div style={{ fontFamily: sans, fontSize: 11, color: C.bad, marginTop: 6 }}>{keyError}</div>}
-        <div style={{ fontFamily: sans, fontSize: 11, color: C.dim, marginTop: 8, textAlign: "center" }}>
-          Setelah bayar di Lynk.id, license key dikirim via WhatsApp dalam 1×24 jam.
+        <div style={{ fontFamily: sans, fontSize: 11, color: C.dim, marginTop: 8, textAlign: "center", lineHeight: 1.6 }}>
+          Setelah bayar di Lynk.id, license key dikirim via WhatsApp dalam 1×24 jam.<br/>
+          Ada kendala? <a href="https://wa.me/6282130311844?text=Halo%2C%20saya%20ada%20kendala%20aktivasi%20Nolkoma%20Pro" target="_blank" rel="noreferrer" style={{ color: C.accent, textDecoration: "none", fontWeight: 600 }}>Hubungi WhatsApp</a>
         </div>
       </div>
     </div>
