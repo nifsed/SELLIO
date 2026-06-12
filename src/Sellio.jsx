@@ -1444,6 +1444,21 @@ export default function Nolkoma() {
     })();
   }, []);
 
+  // Intercept Ctrl+P / Cmd+P — enforce Pro license
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "p") {
+        if (licenseStatus !== "pro") {
+          e.preventDefault();
+          setShowUpgradeModal(true);
+        }
+        // If pro, allow default print behavior
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [licenseStatus]);
+
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2600); };
 
   function confirm(msg, onOk) { setConfirmDlg({ msg, onOk }); }
@@ -1849,7 +1864,7 @@ function parseOrderXlsx(buf) {
             </button>
           )}
           {/* Export PDF — always clickable, Pro only */}
-          <button onClick={exportPDF}
+          <button onClick={exportPDF} title="Export tab ini sebagai PDF (atau tekan Ctrl+P / Cmd+P)"
             style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, padding: "8px 14px", borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel, color: licenseStatus === "pro" ? C.accent : C.ink, cursor: "pointer", letterSpacing: 0.3 }}>
             {licenseStatus === "pro" ? "Export PDF" : "Export PDF 🔒"}
           </button>
@@ -1949,7 +1964,7 @@ function parseOrderXlsx(buf) {
       {panduanOpen && <PanduanModal onClose={() => setPanduanOpen(false)} onGoToOverview={() => { setPanduanOpen(false); setTab("overview"); }} />}
       {showUpgradeModal && <UpgradeModal onActivate={activateLicense} lynkMonthly={LYNK_MONTHLY} lynkLifetime={LYNK_LIFETIME} onClose={licenseStatus === "expired" ? null : () => setShowUpgradeModal(false)} />}
       {(hasAds || hasProd) && (
-        <div style={S.srcStrip}>
+        <div data-noprint style={S.srcStrip}>
           <span style={S.srcChip}>
             <span style={{ ...S.srcDot, background: hasAds ? C.good : C.dim }} />
             File iklan {hasAds ? `· ${active.periodEnd}` : " -  belum ada"}
@@ -1970,7 +1985,7 @@ function parseOrderXlsx(buf) {
 
       {/* snapshot strip */}
       {snapshots.length > 0 && (
-        <div style={S.snapStrip}>
+        <div data-noprint style={S.snapStrip}>
           <span style={S.snapStripLabel}>SNAPSHOT IKLAN</span>
           {snapshots.map((s) => (
             <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 2 }}>
@@ -6037,7 +6052,7 @@ const CSS = `
     header, nav, [data-noprint] { display: none !important; }
     #nolkoma-main-content { padding: 0 !important; }
     body { background: white !important; }
-    @page { margin: 10mm; size: A4; }
+    @page { margin: 8mm; size: A4; }
   }
   ::-webkit-scrollbar-thumb { background: ${C.line}; border-radius: 6px; }
   input::placeholder { color: ${C.dim}; }
