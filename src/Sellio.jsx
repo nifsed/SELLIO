@@ -716,7 +716,7 @@ function parseIncomeXlsx(buf) {
     promoOngkirSeller:  findVal(sumRows, "Promo Gratis Ongkir dari Penjual"),
     totalBiayaAdmin:findVal(sumRows, "Biaya Admin & Layanan"),
     komisiAMS:      findVal(sumRows, "Biaya Komisi AMS"),
-    biayaAdmin:     findVal(sumRows, "Biaya Administrasi (termasuk PPN 11%)"),
+    biayaAdmin:     findVal(sumRows, "Biaya Administrasi (termasuk PPN 11%)") || findVal(sumRows, "Biaya Administrasi"),
     biayaLayanan:   findVal(sumRows, "Biaya Layanan"),
     biayaProses:    findVal(sumRows, "Biaya Proses Pesanan"),
     totalPengeluaran: findVal(sumRows, "Total Pengeluaran", true),
@@ -757,7 +757,7 @@ function parseIncomeXlsx(buf) {
           refund:         n(col("Jumlah Pengembalian Dana ke Pembeli")),
           pengembalianDana: n(col("Pengembalian Dana ke Pembeli")),
           komisiAMS:      n(col("Biaya Komisi AMS")),
-          biayaAdmin:     n(col("Biaya Administrasi (termasuk PPN 11%)")),
+          biayaAdmin:     n(col("Biaya Administrasi (termasuk PPN 11%)")) || n(col("Biaya Administrasi")),
           biayaLayanan:   n(col("Biaya Layanan")),
           biayaProses:    n(col("Biaya Proses Pesanan")),
           totalDilepas:   n(col("Total Penghasilan")),
@@ -912,13 +912,11 @@ function parseTikTokIncomeXlsx(buf) {
     komisiDinamis:  -komisiDinamis,
     biayaProses:    -biayaProses,
     totalDilepas, adSpend,
-    refundOrderCount: hasLaporan ? null : refundOrders.length,
+    refundOrderCount: null,       // not shown for TikTok — sample too small
     refundValue,
-    // When using Laporan, order count from Detail pesanan is incomplete (only released orders)
-    // Don't show order-based refund rate — only value-based rate is accurate
-    totalOrderCount: hasLaporan ? null : orders.length,
-    refundRateOrder: hasLaporan ? null : (orders.length ? (refundOrders.length / orders.length) * 100 : 0),
-    refundRateValue: gmvBruto ? (refundValue / gmvBruto) * 100 : 0,
+    totalOrderCount: null,         // not shown for TikTok — file only captures released orders
+    refundRateOrder: null,         // not shown for TikTok
+    refundRateValue: netGmv ? (refundValue / netGmv) * 100 : 0, // basis Net GMV
     totalFee:       -totalBiayaRaw,
     feeRateNetGmv:  netGmv   ? totalBiayaRaw / netGmv   * 100 : 0,
     feeRateGross:   gmvBruto ? totalBiayaRaw / gmvBruto * 100 : 0,
@@ -4493,11 +4491,11 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     c.shopeeShare   = c.netGmv && sh ? safeNum(sh.netGmv) / c.netGmv * 100 : 0;
     c.tiktokShare   = c.netGmv && tt ? safeNum(tt.netGmv) / c.netGmv * 100 : 0;
     // Combined refund metrics
-    c.refundOrderCount = safeNum(sh?.refundOrderCount) + safeNum(tt?.refundOrderCount);
-    c.refundValue      = safeNum(sh?.refundValue)      + safeNum(tt?.refundValue);
-    c.totalOrderCount  = safeNum(sh?.totalOrderCount)  + safeNum(tt?.totalOrderCount);
+    c.refundOrderCount = safeNum(sh?.refundOrderCount); // TikTok excluded — sample unreliable
+    c.refundValue      = safeNum(sh?.refundValue) + safeNum(tt?.refundValue);
+    c.totalOrderCount  = safeNum(sh?.totalOrderCount);  // TikTok excluded
     c.refundRateOrder  = c.totalOrderCount ? (c.refundOrderCount / c.totalOrderCount) * 100 : 0;
-    c.refundRateValue  = c.hargaAsli ? (c.refundValue / c.hargaAsli) * 100 : 0;
+    c.refundRateValue  = c.netGmv ? (c.refundValue / c.netGmv) * 100 : 0; // basis Net GMV
     return c;
   }, [shopeeSnap, tiktokSnap]);
 
@@ -4513,21 +4511,14 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
         s.refundOrderCount = refundOrders.length;
         s.refundValue      = refundOrders.reduce((t,o) => t + Math.abs(o.pengembalianDana||0), 0);
         s.refundRateOrder  = shopeeSnap.orders.length ? (refundOrders.length / shopeeSnap.orders.length) * 100 : 0;
-        s.refundRateValue  = s.hargaAsli ? (s.refundValue / s.hargaAsli) * 100 : 0;
+        s.refundRateValue  = s.netGmv ? (s.refundValue / s.netGmv) * 100 : 0; // basis Net GMV
       }
       return s;
     }
     if (activeChannel === "tiktok" && tiktokSnap) {
       const t = { ...tiktokSnap.summary };
-      // Fallback: compute refund metrics from orders if not cached (old DB_VER)
-      if (t.totalOrderCount == null && tiktokSnap.orders?.length > 0) {
-        const refundOrders = tiktokSnap.orders.filter(o => o.subtotalRefund < 0);
-        t.totalOrderCount  = tiktokSnap.orders.length;
-        t.refundOrderCount = refundOrders.length;
-        t.refundValue      = refundOrders.reduce((t2,o) => t2 + Math.abs(o.subtotalRefund||0), 0);
-        t.refundRateOrder  = tiktokSnap.orders.length ? (refundOrders.length / tiktokSnap.orders.length) * 100 : 0;
-        t.refundRateValue  = t.gmvBruto ? (t.refundValue / t.gmvBruto) * 100 : 0;
-      }
+      // No fallback for TikTok — always use Laporan sheet values which are authoritative
+      // Per-order refundValue is unreliable (only settled orders captured)
       return { ...t, hargaAsli: t.gmvBruto, diskonProduk: t.diskonPenjual };
     }
     return null;
@@ -4636,18 +4627,18 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
         <FeeKpi label="Total Dilepas ke Saldo" value={rpShort(ds?.totalDilepas || 0)} color={C.good} sub={"masuk saldo penjual"} />
         <FeeKpi label="Fee Rate vs Harga Asli" value={(ds?.feeRateGross || 0).toFixed(1)+"%"} color={C.watch} />
         <FeeKpi label="Take Rate Total" value={(ds?.takeRate || 0).toFixed(1)+"%"} color={C.watch} sub={"% Net GMV yg tidak masuk saldo"} />
-        {snap?.orders && <FeeKpi label="Jumlah Pesanan" value={snap.orders.length.toLocaleString("id-ID")} color={C.muted} sub={ds?.dataSource === "laporan" ? "data tidak lengkap — hanya pesanan yang dilepas di periode ini" : (snap.periodStart||"") + " → " + (snap.periodEnd||"")} />}
-        {ds?.totalOrderCount > 0 && <FeeKpi
+        {/* Jumlah Pesanan card removed — TikTok file only captures released orders, misleading */}
+        {ds?.totalOrderCount > 0 && ds?.refundRateOrder != null && <FeeKpi
           label="Retur / Refund (order)"
           value={(ds.refundRateOrder || 0).toFixed(1) + "%"}
           color={ds.refundRateOrder > 5 ? C.bad : ds.refundRateOrder > 2 ? C.watch : C.good}
           sub={`${ds.refundOrderCount} dari ${ds.totalOrderCount} order · ${rpShort(ds.refundValue || 0)}`}
         />}
-        {ds?.totalOrderCount > 0 && <FeeKpi
+        {(ds?.refundValue > 0 || ds?.totalOrderCount > 0) && <FeeKpi
           label="Retur / Refund (nilai)"
           value={(ds.refundRateValue || 0).toFixed(2) + "%"}
           color={ds.refundRateValue > 5 ? C.bad : ds.refundRateValue > 2 ? C.watch : C.good}
-          sub={"dari total GMV Bruto · " + (ds.refundRateValue < 1 ? "sehat ✓" : ds.refundRateValue < 3 ? "normal" : "perlu dicek")}
+          sub={(rpShort(ds.refundValue || 0)) + " · dari Net GMV · " + (ds.refundRateValue < 1 ? "sehat ✓" : ds.refundRateValue < 3 ? "normal" : "perlu dicek")}
         />}
       </div>
 
