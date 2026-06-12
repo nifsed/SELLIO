@@ -346,20 +346,80 @@ function calcDio(units, unitsSold, periodDays) {
 }
 
 // DIO thresholds
-const DIO_OVERSTOCK = 90;  // > 90 days = overstock
-const DIO_SAFE     = 30;   // 30-90 days = safe zone
-const DIO_LOW      = 14;   // 14-30 days = watch
+const DIO_OVERSTOCK = 60;  // > 60 days = overstock
+const DIO_SAFE     = 30;   // 30-60 days = safe zone
+const DIO_LOW      = 14;   // 14-30 days = watch / tipis
 const DIO_CRITICAL = 14;   // < 14 days = critical
 
-function dioLabel(dio) {
+function dioLabel(dio, dioOverstock = DIO_OVERSTOCK, dioSafe = DIO_SAFE, dioLow = DIO_LOW) {
   if (dio === null) return null;
-  if (dio > DIO_OVERSTOCK) return { tag: "OVERSTOCK",  color: "#58a6ff", level: "overstock" };
-  if (dio > DIO_SAFE)      return { tag: "AMAN",       color: "#3fb950", level: "safe" };
-  if (dio > DIO_LOW)       return { tag: "WATCH",      color: "#d29922", level: "low" };
+  if (dio > dioOverstock) return { tag: "OVERSTOCK",  color: "#58a6ff", level: "overstock" };
+  if (dio > dioSafe)      return { tag: "AMAN",       color: "#3fb950", level: "safe" };
+  if (dio > dioLow)       return { tag: "WATCH",      color: "#d29922", level: "low" };
   return                          { tag: "KRITIS",     color: "#f85149", level: "critical" };
 }
 
 // Decision tree: stock condition × ad performance → recommendation
+/* ---------- Industry Presets --------------------------------------------- */
+const INDUSTRY_PRESETS = {
+  fashion: {
+    label: "Fashion & Apparel",
+    icon: "👕",
+    dioSafe: 60, dioLow: 14, dioCritical: 14,
+    targetRoas: 7, minCtr: 2, minCvr: 1,
+    seasonal: { 1:1.0, 2:0.9, 3:3.5, 4:0.6, 5:1.0, 6:1.1, 7:1.0, 8:1.0, 9:1.0, 10:1.0, 11:1.2, 12:1.8 },
+    note: "Threshold DIO 30–60 hari. Peak: Ramadan (Mar), Harbolnas (Des), Lebaran.",
+  },
+  beauty: {
+    label: "Kecantikan & Skincare",
+    icon: "💄",
+    dioSafe: 45, dioLow: 14, dioCritical: 7,
+    targetRoas: 6, minCtr: 1.5, minCvr: 1.2,
+    seasonal: { 1:1.0, 2:1.1, 3:2.0, 4:0.8, 5:1.0, 6:1.0, 7:0.9, 8:1.0, 9:1.0, 10:1.1, 11:1.3, 12:1.5 },
+    note: "DIO ideal 30–45 hari. Peak: Ramadan, Harbolnas, Valentine.",
+  },
+  food: {
+    label: "Makanan & Minuman (FMCG)",
+    icon: "🍱",
+    dioSafe: 21, dioLow: 7, dioCritical: 3,
+    targetRoas: 4, minCtr: 1.5, minCvr: 1.5,
+    seasonal: { 1:1.0, 2:1.0, 3:2.5, 4:0.7, 5:1.0, 6:1.0, 7:1.0, 8:1.0, 9:1.0, 10:1.0, 11:1.1, 12:1.3 },
+    note: "DIO ideal 7–21 hari (produk cepat basi). Peak: Ramadan, akhir tahun.",
+  },
+  electronics: {
+    label: "Elektronik & Gadget",
+    icon: "📱",
+    dioSafe: 90, dioLow: 30, dioCritical: 14,
+    targetRoas: 5, minCtr: 1.0, minCvr: 0.5,
+    seasonal: { 1:0.9, 2:0.9, 3:1.2, 4:0.8, 5:1.0, 6:1.0, 7:1.0, 8:1.0, 9:1.0, 10:1.0, 11:1.5, 12:2.0 },
+    note: "DIO 30–90 hari wajar. CVR rendah normal karena harga tinggi. Peak: Harbolnas, gajian.",
+  },
+  home: {
+    label: "Rumah Tangga & Furnitur",
+    icon: "🏠",
+    dioSafe: 75, dioLow: 21, dioCritical: 14,
+    targetRoas: 5, minCtr: 1.0, minCvr: 0.8,
+    seasonal: { 1:1.0, 2:1.0, 3:1.5, 4:0.8, 5:1.0, 6:1.0, 7:1.0, 8:1.0, 9:1.1, 10:1.0, 11:1.2, 12:1.3 },
+    note: "DIO 21–75 hari. Peak: pindahan awal tahun, Ramadan, akhir tahun.",
+  },
+  sports: {
+    label: "Olahraga & Outdoor",
+    icon: "⚽",
+    dioSafe: 60, dioLow: 14, dioCritical: 7,
+    targetRoas: 6, minCtr: 1.5, minCvr: 1.0,
+    seasonal: { 1:1.2, 2:1.1, 3:1.0, 4:0.9, 5:1.0, 6:1.0, 7:1.1, 8:1.0, 9:1.0, 10:0.9, 11:1.0, 12:1.1 },
+    note: "DIO 14–60 hari. Peak: awal tahun (resolusi), pertengahan tahun.",
+  },
+  other: {
+    label: "Industri Lainnya",
+    icon: "📦",
+    dioSafe: 60, dioLow: 14, dioCritical: 7,
+    targetRoas: 6, minCtr: 1.5, minCvr: 1.0,
+    seasonal: { 1:1.0, 2:1.0, 3:1.5, 4:0.8, 5:1.0, 6:1.0, 7:1.0, 8:1.0, 9:1.0, 10:1.0, 11:1.2, 12:1.5 },
+    note: "Gunakan threshold default. Sesuaikan di tab COGS/Margin → Thresholds jika perlu.",
+  },
+};
+
 /* ---------- Seasonal multipliers ----------------------------------------- */
 // Default Indonesia fashion marketplace seasonality (editable in UI)
 const DEFAULT_SEASONAL = {
@@ -368,44 +428,75 @@ const DEFAULT_SEASONAL = {
 };
 
 // Forecast demand for next N days from today's date, applying seasonal multiplier
-function forecastDemand(dailyRate, periodDays, days = 30) {
+function forecastDemand(dailyRate, periodDays, days = 30, seasonal = DEFAULT_SEASONAL) {
   const now = new Date();
   const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
   const month = nextMonth.getMonth() + 1; // 1-12
-  const mult = DEFAULT_SEASONAL[month] ?? 1.0;
+  const mult = seasonal[month] ?? 1.0;
   return { units: Math.round(dailyRate * days * mult), mult, month };
 }
 
-// stockAdRec  -  table pill only (short label). Full reasoning is in buildDecision.
+// stockAdRec — comprehensive decision engine based on Hanif's operator framework
 function stockAdRec(dio, roas, targetRoas, quadrant, ad, thresholds) {
   const dioLvl = dioLabel(dio)?.level;
   if (!dioLvl) return null;
-  const tr = targetRoas;
-  const roasStrong  = roas >= tr * 1.5;
-  const roasOk      = roas >= tr;
-  const roasDead    = roas < tr * 0.75;
-  const ctrLow      = ad ? ad.ctr < (thresholds?.minCtr || 2) : false;
-  const cvrLow      = ad ? ad.cvr < (thresholds?.minCvr || 1) : false;
+  const tr = targetRoas || 7;
+  const roasStrong = roas >= tr * 1.3;
+  const roasOk     = roas >= tr;
+  const roasLow    = roas < tr && roas >= tr * 0.6;
+  const roasDead   = roas < tr * 0.6;
+  const ctrLow     = ad ? ad.ctr < (thresholds?.minCtr || 2) : false;
+  const cvrLow     = ad ? ad.cvr < (thresholds?.minCvr || 1) : false;
 
+  // ── STOK KRITIS (<14 hari) ──────────────────────────────────────────────
   if (dioLvl === "critical") {
-    if (roasDead || (ctrLow && cvrLow)) return { action: "PAUSE + RESTOCK", level: "bad" };
-    if (roasStrong) return { action: "TURUN BUDGET", level: "watch" };
-    return { action: "KURANGI BUDGET", level: "watch" };
+    if (roasDead || (ctrLow && cvrLow))
+      return { action: "PAUSE + RESTOCK", level: "bad" };
+    if (roasStrong)
+      return { action: "TURUNKAN BUDGET", level: "watch" };
+    return { action: "KURANGI BUDGET + RESTOCK", level: "watch" };
   }
+
+  // ── STOK RENDAH (14-30 hari) ─────────────────────────────────────────────
   if (dioLvl === "low") {
-    if (roasDead) return { action: "PAUSE + PO", level: "bad" };
-    if (roasStrong) return { action: "NAIKKAN ROAS TARGET", level: "watch" };
-    return { action: "KURANGI BUDGET", level: "watch" };
+    if (roasDead) return { action: "PAUSE + PO SEGERA", level: "bad" };
+    if (roasStrong) return { action: "JAGA BUDGET + RESTOCK", level: "watch" };
+    return { action: "MAINTAIN + RESTOCK", level: "watch" };
   }
+
+  // ── OVERSTOCK — logic cashflow-first ────────────────────────────────────
   if (dioLvl === "overstock") {
-    if (roasDead) return { action: "STOP IKLAN", level: "bad" };
-    return { action: "REM BUDGET", level: "watch" };
+    // 45-60 hari: turunkan ROAS bertahap -1 per cek sampai traffic/ATC naik
+    if (dio <= 60) {
+      if (quadrant === "dog")
+        return { action: "VALIDASI DULU", level: "watch" };
+      if (roasDead)
+        return { action: "AUDIT CREATIVE + PRICING", level: "bad" };
+      return { action: "TURUN ROAS BERTAHAP", level: "watch" };
+    }
+    // 60-90 hari: target ROAS 6-7, fokus likuidasi
+    if (dio <= 90) {
+      if (quadrant === "dog")
+        return { action: "DISCONTINUE", level: "bad" };
+      if (roasDead)
+        return { action: "FLASH SALE + CREATIVE BARU", level: "bad" };
+      return { action: "LIKUIDASI — ROAS 6-7", level: "watch" };
+    }
+    // >90 hari: darurat, ROAS 4-5, semua lever dipakai
+    if (quadrant === "dog")
+      return { action: "DISCONTINUE SEGERA", level: "bad" };
+    return { action: "LIKUIDASI DARURAT — ROAS 4-5", level: "bad" };
   }
-  // safe
-  if (roasStrong && (quadrant === "star" || quadrant === "question")) return { action: "SCALE", level: "good" };
-  if (roasStrong && quadrant === "cashcow") return { action: "FIX CVR DULU", level: "watch" };
-  if (roasOk) return { action: "MAINTAIN", level: "good" };
-  if (roasDead) return { action: "STOP & AUDIT", level: "bad" };
+
+  // ── STOK AMAN (30-45 hari) ───────────────────────────────────────────────
+  if (roasStrong && (quadrant === "star" || quadrant === "question"))
+    return { action: "SCALE", level: "good" };
+  if (roasStrong && quadrant === "cashcow")
+    return { action: "FIX CVR DULU", level: "watch" };
+  if (roasOk)
+    return { action: "MAINTAIN", level: "good" };
+  if (roasDead)
+    return { action: "STOP & AUDIT", level: "bad" };
   return { action: "OPTIMALKAN", level: "watch" };
 }
 
@@ -1303,6 +1394,9 @@ export default function Nolkoma() {
   const TRIAL_DAYS = 2;
   const LYNK_MONTHLY = "https://lynk.id/hanifmhu/s/nolkoma-pro-bulanan";
   const LYNK_LIFETIME = "https://lynk.id/hanifmhu/s/nolkoma-pro-selamanya";
+  const [industry, setIndustry] = useState("fashion");
+  const [showIndustryPicker, setShowIndustryPicker] = useState(false);
+  const industryPreset = INDUSTRY_PRESETS[industry] || INDUSTRY_PRESETS.fashion;
   const [exporting, setExporting] = useState(false);
 
   function exportPDF() {
@@ -1418,6 +1512,8 @@ export default function Nolkoma() {
       const st = await idbAll("settings");
       const thRec = st.find((x) => x.key === "thresholds");
       if (thRec) setThresholds({ ...DEFAULT_TH, ...thRec.value });
+      const industryRec = st.find((x) => x.key === "industry");
+      if (industryRec) setIndustry(industryRec.value);
       const incomes = await idbAll("income");
       incomes.sort((a, b) => (a.periodEnd < b.periodEnd ? 1 : -1));
       setIncomeSnaps(incomes);
@@ -1839,18 +1935,22 @@ function parseOrderXlsx(buf) {
           </div>
         </div>
         <div style={S.topActions}>
-          {active && <span style={S.storeTag}>{active.store}</span>}
-          {/* Trial / Pro badge */}
-          {licenseStatus === "trial" && trialDaysLeft !== null && (
-            <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 20, background: "#FEF3C7", color: "#92400E", border: "1px solid #FDE68A", letterSpacing: 0.3 }}>
-              Trial · {trialDaysLeft} hari tersisa
-            </span>
+          {active && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={S.storeTag}>{active.store}</span>
+              {licenseStatus === "pro" && (
+                <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 20, background: "#DCFCE7", color: "#166534", border: "1px solid #BBF7D0", letterSpacing: 0.3 }}>Pro</span>
+              )}
+              {licenseStatus === "trial" && trialDaysLeft !== null && (
+                <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 20, background: "#FEF3C7", color: "#92400E", border: "1px solid #FDE68A", letterSpacing: 0.3 }}>Trial {trialDaysLeft}h</span>
+              )}
+            </div>
           )}
-          {licenseStatus === "pro" && (
-            <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 20, background: "#DCFCE7", color: "#166534", border: "1px solid #BBF7D0", letterSpacing: 0.3 }}>
-              Pro ✓
-            </span>
-          )}
+          {/* Industry selector */}
+          <button onClick={() => setShowIndustryPicker(true)}
+            style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, padding: "6px 12px", borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel2, color: C.muted, cursor: "pointer", letterSpacing: 0.3 }}>
+            {INDUSTRY_PRESETS[industry]?.label.split(" ")[0]}
+          </button>
           <button
             style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, padding: "8px 14px", borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel2, color: C.muted, cursor: "pointer", letterSpacing: 0.3 }}
             onClick={() => setPanduanOpen(true)}>
@@ -1963,6 +2063,7 @@ function parseOrderXlsx(buf) {
 
       {panduanOpen && <PanduanModal onClose={() => setPanduanOpen(false)} onGoToOverview={() => { setPanduanOpen(false); setTab("overview"); }} />}
       {showUpgradeModal && <UpgradeModal onActivate={activateLicense} lynkMonthly={LYNK_MONTHLY} lynkLifetime={LYNK_LIFETIME} onClose={licenseStatus === "expired" ? null : () => setShowUpgradeModal(false)} />}
+      {showIndustryPicker && <IndustryPicker current={industry} onChange={async (ind) => { setIndustry(ind); await idbPut("settings", { key: "industry", value: ind }); showToast(`Industri diubah ke ${INDUSTRY_PRESETS[ind]?.label}`); }} onClose={() => setShowIndustryPicker(false)} />}
       {(hasAds || hasProd) && (
         <div data-noprint style={S.srcStrip}>
           <span style={S.srcChip}>
@@ -3695,8 +3796,10 @@ function InventoryTab({ snap, active, thresholds, stockMap, setStockMap }) {
         Daily sales = unit terjual ÷ {periodDays} hari periode. Forecast = daily rate × 30 hari.
         {!active && <span style={{ color: C.watch }}> Import file iklan untuk analisa ROAS & rekomendasi iklan.</span>}
       </div>
-
-      {/* Summary bar */}
+      <div style={{ background: "#FEF9C3", border: "1px solid #FDE68A", borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontFamily: sans, fontSize: 11, color: "#78350F", lineHeight: 1.7 }}>
+        <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, letterSpacing: 0.8, marginRight: 6 }}>DISCLAIMER</span>
+        Rekomendasi keputusan di tab ini bersifat <b>panduan berbasis benchmark umum</b> — bukan saran operasional final. Threshold DIO, target ROAS, dan saran iklan dihitung dari data historis periode yang diimport. Validasi dengan kondisi cashflow, kapasitas produksi, dan konteks bisnis kamu sebelum mengeksekusi. Untuk industri non-fashion, sesuaikan preset industri di tombol kiri atas.
+      </div>      {/* Summary bar */}
       <div style={S.kpiGrid}>
         <Kpi label="SKU dipantau" value={`${withStock} / ${skus.length}`} dir="neutral" />
         <Kpi label="Total restock bulan ini" value={`${nfmt(totalRestockQty)} unit`} dir="neutral" />
@@ -3952,20 +4055,38 @@ function buildDecision(s, ad, dio, roas, tr, thresholds) {
       body: `Stok ${dio} hari, iklan ROAS ${roas.toFixed(1)}x ${p.roasOk ? "oke" : "di bawah target"}. Kurangi budget 20–30% untuk perlambat laju jual. Konfirmasi PO ${nfmt(s.restockQty || 0)} unit. Stockout saat iklan aktif = ranking turun + review negatif + momentum hilang  -  biaya yang lebih mahal dari biaya iklan itu sendiri.` };
   }
 
-  // ── STOK OVERSTOCK (>90hr) ───────────────────────────────────────────────
+  // ── STOK OVERSTOCK — cashflow-first framework ────────────────────────────
   if (dioLvl === "overstock") {
     if (!p) return { action: "GERAKIN STOK (ORGANIK)", level: "watch",
-      body: `DIO ${dio} hari  -  modal tertahan terlalu lama. Target ideal fashion: 60–90 hari DIO. Aktifkan flash sale atau voucher seller untuk akselerasi perputaran. Tahan restock sampai DIO turun ke bawah 45 hari.` };
-    if (p.roasDead) {
-      return { action: "STOP IKLAN + CLEARANCE", level: "bad",
-        body: `Double problem: stok numpuk ${dio} hari + iklan tidak efisien (ROAS ${roas.toFixed(1)}x < ${(tr * 0.75).toFixed(1)}x). Tidak ada justifikasi membakar budget iklan di kondisi ini. Langkah wajib: (1) Stop iklan sekarang  -  alokasikan budget ke SKU Star/Question Mark. (2) Flash sale agresif: diskon 15–20% selama 7 hari, target habiskan ${Math.round((s.stockUnits || 0) * 0.4)} unit. (3) Jika tidak bergerak dalam 14 hari, pertimbangkan bundle dengan SKU lain atau clearance.` };
+      body: `DIO ${dio} hari — modal tertahan terlalu lama. Target sehat fashion: 30–45 hari DIO. Aktifkan flash sale atau voucher seller untuk akselerasi perputaran. Tahan restock sampai DIO turun ke bawah 30 hari.` };
+
+    // Dog overstock — validasi dulu sebelum discontinue
+    if (q === "dog") {
+      return { action: "VALIDASI SEBELUM DISCONTINUE", level: "bad",
+        body: `Dog dengan overstock ${dio} hari — kombinasi paling menguras cashflow. Sebelum discontinue, validasi dulu: (1) Ada loss sales di tengah bulan karena produksi lambat atau trouble? — kalau iya, masalahnya bukan produk tapi operasional. (2) Stok full dan terbukti tidak bergerak organik? → Clearance agresif, stop produksi. (3) Iklan ROAS ${roas?.toFixed(1)}x — ${p?.roasOk ? "walau profitable, modal jauh lebih efisien di SKU lain." : "tidak efisien, hentikan spend sekarang."} Keputusan discontinue hanya setelah validasi selesai.` };
     }
-    if (p.roasOk) {
-      return { action: "REM BUDGET", level: "watch",
-        body: `Iklan masih profitable (ROAS ${roas.toFixed(1)}x) tapi tidak perlu didorong  -  stok sudah ${dio} hari. Kurangi budget iklan 40–60%, alihkan ke percepat perputaran stok via flash sale atau promo. Target: turunkan DIO ke bawah 60 hari. Jangan restock sampai DIO < 45 hari. Budget yang dihemat lebih baik dialokasikan ke SKU dengan stok lebih sehat.` };
+
+    // 45-60 hari: turunkan ROAS bertahap
+    if (dio <= 60) {
+      if (p.roasDead) return { action: "AUDIT CREATIVE + PRICING", level: "bad",
+        body: `Overstock ${dio} hari + iklan tidak efisien (ROAS ${roas.toFixed(1)}x) — dua masalah sekaligus. Langkah: (1) Stop spend dulu. (2) Audit harga vs kompetitor: ada ruang turun 5–10% untuk percepat perputaran? (3) Ganti materi iklan: foto, video, hook opening. (4) Aktifkan voucher seller atau flash sale untuk dorong organik sambil audit berjalan. Restart iklan setelah DIO turun ke 30 hari.` };
+      return { action: "TURUN ROAS BERTAHAP", level: "watch",
+        body: `Overstock ${dio} hari — stok perlu digerakkan tapi iklan masih profitable (ROAS ${roas.toFixed(1)}x). Turunkan target ROAS -1 langkah per periode cek (${roas.toFixed(0)}x → ${(roas-1).toFixed(0)}x → ${(roas-2).toFixed(0)}x). Pantau traffic dan ATC naik sebelum turun lagi. Sambil itu: (1) Aktifkan promo momen — double date, payday, flash sale. (2) Refresh thumbnail dan hook opening video. (3) Cek pricing: ada ruang 5–10% turun tanpa rusak margin minimum? Target DIO: turun ke bawah 30 hari.` };
     }
-    return { action: "REM + OPTIMALKAN", level: "watch",
-      body: `Overstock ${dio} hari dengan iklan marginal (ROAS ${roas.toFixed(1)}x). Kurangi budget, aktifkan promo organik. ${p.ctrLow ? "CTR rendah  -  ganti thumbnail." : ""} ${p.cvrLow ? "CVR rendah  -  audit harga vs kompetitor." : ""} Fokus gerakin stok dulu sebelum bicara optimasi iklan.` };
+
+    // 60-90 hari: target ROAS 6-7, likuidasi sambil jaga margin
+    if (dio <= 90) {
+      if (p.roasDead) return { action: "FLASH SALE + CREATIVE BARU", level: "bad",
+        body: `Overstock ${dio} hari + iklan mati (ROAS ${roas.toFixed(1)}x) — cashflow dalam tekanan. Stop spend. Langkah urgen: (1) Flash sale 7–14 hari: diskon 15–20%, voucher seller agresif. (2) Ganti materi iklan total. (3) Setelah creative baru siap, restart dengan target ROAS 6–7x untuk tingkatkan volume. (4) Bundle dengan SKU Star untuk bantu clearance. Target: bebaskan cash dari stok ini dulu.` };
+      return { action: "LIKUIDASI — TARGET ROAS 6-7", level: "watch",
+        body: `Overstock ${dio} hari — modal tertahan terlalu lama. Turunkan target ROAS ke 6–7x (dari ${roas.toFixed(1)}x) untuk naikkan volume traffic sambil jaga margin profitabilitas. Lever tambahan: (1) Flash sale di momen payday/double date. (2) Sample ke kreator organik untuk generate traffic non-paid. (3) Pantau margin per unit — jaga di atas break-even. Cash yang dibebaskan alokasikan ke SKU Star. Target: DIO turun ke 30–45 hari dalam 4 minggu.` };
+    }
+
+    // >90 hari: darurat, ROAS 4-5, semua lever
+    if (p.roasDead) return { action: "LIKUIDASI DARURAT", level: "bad",
+      body: `DARURAT: Overstock ${dio} hari + iklan tidak efisien (ROAS ${roas.toFixed(1)}x) — cashflow paling berat. Tindakan sekarang: (1) Hentikan semua spend. (2) Flash sale agresif minimum 20–25% diskon, semua voucher aktif. (3) Restart iklan dengan target ROAS 4–5x — prioritas volume bukan margin jangka pendek. (4) Bundle, clearance lot, atau channel lain (Tokopedia, offline). Cash yang dibebaskan langsung ke SKU sehat. DIO harus turun ke bawah 30 hari dalam 2–3 minggu.` };
+    return { action: "LIKUIDASI DARURAT — ROAS 4-5", level: "bad",
+      body: `DARURAT: Overstock ${dio} hari — cashflow tertekan. Fokus sekarang: kecepatan perputaran bukan profitabilitas per unit. Turunkan target ROAS ke 4–5x untuk maksimalkan volume. Aktifkan semua lever: flash sale agresif, voucher seller di setiap momen, sample ke kreator, bundle dengan SKU lain. Target: habiskan minimal 50% stok dalam 3 minggu. Cash yang dibebaskan langsung ke operasional dan SKU sehat.` };
   }
 
   // ── STOK AMAN (30–90hr) ──────────────────────────────────────────────────
@@ -4038,6 +4159,41 @@ function FeeKpi({ label, value, color, sub, wide, highlight }) {
 /* ============================================================================
    UPGRADE MODAL — Trial expired / paywall
    ========================================================================== */
+/* ============================================================================
+   INDUSTRY PICKER MODAL
+   ========================================================================== */
+function IndustryPicker({ current, onChange, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.7)", backdropFilter: "blur(4px)", zIndex: 9998, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: "#fff", borderRadius: 16, padding: "28px 24px", maxWidth: 520, width: "100%", boxShadow: "0 24px 64px rgba(0,0,0,0.15)", position: "relative", maxHeight: "90vh", overflowY: "auto" }}>
+        <button onClick={onClose} style={{ position: "absolute", top: 14, right: 16, background: "none", border: "none", fontSize: 18, color: C.dim, cursor: "pointer" }}>✕</button>
+        <div style={{ fontFamily: sans, fontSize: 17, fontWeight: 800, color: C.ink, marginBottom: 4 }}>Pilih Industri</div>
+        <div style={{ fontFamily: sans, fontSize: 12, color: C.muted, marginBottom: 8, lineHeight: 1.6 }}>
+          Threshold DIO, target ROAS, dan multiplier musiman otomatis menyesuaikan ke industri yang dipilih.
+        </div>
+        <div style={{ background: "#FEF9C3", border: "1px solid #FDE68A", borderRadius: 8, padding: "10px 14px", marginBottom: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, color: "#92400E", letterSpacing: 0.8, marginBottom: 4 }}>DISCLAIMER</div>
+          <div style={{ fontFamily: sans, fontSize: 11, color: "#78350F", lineHeight: 1.7 }}>
+            Threshold dan rekomendasi ini bersifat <b>panduan awal berbasis benchmark umum</b> industri marketplace Indonesia — bukan saran keuangan atau operasional yang bersifat final. Setiap bisnis punya kondisi cashflow, margin, dan kapasitas produksi yang berbeda. Validasi dengan konteks operasional kamu sebelum mengambil keputusan. Target ROAS dan DIO yang ditampilkan adalah titik referensi yang konservatif untuk meminimalkan risiko, bukan angka optimal untuk semua situasi.
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {Object.entries(INDUSTRY_PRESETS).map(([key, preset]) => (
+            <div key={key} onClick={() => { onChange(key); onClose(); }}
+              style={{ border: `2px solid ${current === key ? C.accent : C.line}`, background: current === key ? "#EEF2FF" : C.panel, borderRadius: 10, padding: "14px", cursor: "pointer" }}>
+              <div style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink, marginBottom: 6 }}>{preset.label}</div>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, lineHeight: 1.8 }}>
+                DIO aman: {preset.dioSafe} hari<br/>ROAS target: {preset.targetRoas}x
+              </div>
+              <div style={{ fontFamily: sans, fontSize: 10, color: C.dim, marginTop: 6, lineHeight: 1.5 }}>{preset.note}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function UpgradeModal({ onActivate, lynkMonthly, lynkLifetime, onClose }) {
   const [keyInput, setKeyInput] = useState("");
   const [keyError, setKeyError] = useState("");
