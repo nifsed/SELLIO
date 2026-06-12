@@ -1754,13 +1754,20 @@ function parseOrderXlsx(buf) {
 
   const colOrder    = col("no. pesanan") >= 0 ? col("no. pesanan") : col("order id");
   const colStatus   = col("status pesanan") >= 0 ? col("status pesanan") : col("status");
+  const colCancel   = col("status pembatalan");
   const colProv     = col("provinsi") >= 0 ? col("provinsi") : col("province");
   const colKota     = col("kota") >= 0 ? col("kota") : col("city");
   const colTotal    = col("total pembayaran") >= 0 ? col("total pembayaran") : col("total");
   const colTgl      = col("waktu pembayaran") >= 0 ? col("waktu pembayaran") : col("tanggal");
+  const colTglSelesai = col("waktu pesanan selesai");
   const colSKU      = col("sku induk") >= 0 ? col("sku induk") : col("sku");
   const colProduk   = col("nama produk") >= 0 ? col("nama produk") : col("produk");
+  const colVariasi  = col("nama variasi");
   const colQty      = col("jumlah") >= 0 ? col("jumlah") : col("qty");
+  const colReturQty = col("returned quantity");
+  const colHargaDiskon = col("harga setelah diskon");
+  const colSubtotal = col("subtotal pesanan");
+  const colDiskonPenjual = col("diskon dari penjual");
 
   const orders = [];
   let periodStart = "", periodEnd = "";
@@ -1774,20 +1781,50 @@ function parseOrderXlsx(buf) {
       if (!periodStart || tgl < periodStart) periodStart = tgl;
       if (!periodEnd   || tgl > periodEnd)   periodEnd   = tgl;
     }
+    const statusStr = String(r[colStatus] ?? "").trim();
+    const cancelStr = colCancel >= 0 ? String(r[colCancel] ?? "").trim() : "";
+    // Skip cancelled orders with no return — only keep Selesai, Retur, and in-transit
+    const isSelesai = statusStr === "Selesai" || statusStr.startsWith("Pesanan diterima");
+    const isBatal = statusStr === "Batal" && !cancelStr.includes("Pengembalian");
+    if (isBatal) continue;
     orders.push({
-      id:       orderId,
+      id:           orderId,
       tgl,
-      status:   String(r[colStatus] ?? "").trim(),
-      provinsi: String(r[colProv]   ?? "").trim(),
-      kota:     String(r[colKota]   ?? "").trim(),
-      total:    n(r[colTotal]),
-      sku:      colSKU    >= 0 ? String(r[colSKU]    ?? "").trim() : "",
-      produk:   colProduk >= 0 ? String(r[colProduk] ?? "").trim() : "",
-      qty:      colQty    >= 0 ? n(r[colQty]) : 1,
+      tglSelesai:   colTglSelesai >= 0 ? String(r[colTglSelesai] ?? "").slice(0,10) : "",
+      status:       statusStr,
+      cancelStatus: cancelStr,
+      provinsi:     String(r[colProv]   ?? "").trim(),
+      kota:         String(r[colKota]   ?? "").trim(),
+      total:        n(r[colTotal]),
+      subtotal:     colSubtotal >= 0 ? n(r[colSubtotal]) : n(r[colTotal]),
+      hargaDiskon:  colHargaDiskon >= 0 ? n(r[colHargaDiskon]) : 0,
+      diskonPenjual: colDiskonPenjual >= 0 ? n(r[colDiskonPenjual]) : 0,
+      sku:          colSKU    >= 0 ? String(r[colSKU]    ?? "").trim() : "",
+      produk:       colProduk >= 0 ? String(r[colProduk] ?? "").trim() : "",
+      variasi:      colVariasi >= 0 ? String(r[colVariasi] ?? "").trim() : "",
+      qty:          colQty    >= 0 ? n(r[colQty]) : 1,
+      returQty:     colReturQty >= 0 ? n(r[colReturQty]) : 0,
+      isRetur:      cancelStr.includes("Pengembalian") || (colReturQty >= 0 && n(r[colReturQty]) > 0),
+      isSelesai,
     });
   }
 
-  return { orders, periodStart, periodEnd };
+  // Build summary
+  const selesaiOrders = orders.filter(o => o.isSelesai);
+  const returOrders   = orders.filter(o => o.isRetur);
+  const gmvSelesai    = selesaiOrders.reduce((t,o) => t + o.subtotal, 0);
+  const nilaiRetur    = returOrders.reduce((t,o) => t + o.subtotal, 0);
+  const summary = {
+    totalOrders:    orders.length,
+    selesaiCount:   selesaiOrders.length,
+    returCount:     returOrders.length,
+    returQtyTotal:  returOrders.reduce((t,o) => t + o.returQty, 0),
+    gmvSelesai,
+    nilaiRetur,
+    returRateOrder: selesaiOrders.length ? (returOrders.length / selesaiOrders.length * 100) : 0,
+    returRateNilai: gmvSelesai ? (nilaiRetur / gmvSelesai * 100) : 0,
+  };
+  return { orders, summary, periodStart, periodEnd };
 }
 
   async function handleOrderFile(e) {
@@ -4866,13 +4903,11 @@ function AreaTab({ snap }) {
   const [view, setView] = React.useState("provinsi"); // "provinsi" | "kota"
   const [sortBy, setSortBy] = React.useState("pesanan"); // "pesanan" | "pcs"
 
-  const { byProvinsi, byKota, highlights } = useMemo(() => {
+  const { byProvinsi, byKota, highlights, returData } = useMemo(() => {
     const orders = snap.orders || [];
+    const summary = snap.summary || {};
     const total = orders.length;
-    const totalPcs = orders.reduce((t, o) => t + o.jumlah, 0);
-    const selesai = orders.filter(o => o.selesai).length;
-    const cancelRate = snap.orders.length > 0
-      ? 100 - (orders.length / (orders.length + (snap._rawTotal || orders.length)) * 100) : 0;
+    const totalPcs = orders.reduce((t, o) => t + (o.qty || o.jumlah || 1), 0);
 
     // Group by provinsi
     const provMap = {};
@@ -4882,11 +4917,12 @@ function AreaTab({ snap }) {
       const kota = o.kota || "Tidak diketahui";
       if (!provMap[prov]) provMap[prov] = { pesanan: 0, pcs: 0, kota: {} };
       provMap[prov].pesanan++;
-      provMap[prov].pcs += o.jumlah;
-      provMap[prov].kota[kota] = (provMap[prov].kota[kota] || 0) + o.jumlah;
+      const pcs = o.qty || o.jumlah || 1;
+      provMap[prov].pcs += pcs;
+      provMap[prov].kota[kota] = (provMap[prov].kota[kota] || 0) + pcs;
       if (!kotaMap[kota]) kotaMap[kota] = { pesanan: 0, pcs: 0, provinsi: prov };
       kotaMap[kota].pesanan++;
-      kotaMap[kota].pcs += o.jumlah;
+      kotaMap[kota].pcs += pcs;
     });
 
     const byProvinsi = Object.entries(provMap)
@@ -4913,7 +4949,20 @@ function AreaTab({ snap }) {
       { icon: "☕", label: "Jawa vs Luar Jawa", value: `${((jawaPesanan/total)*100).toFixed(0)}% Jawa`, sub: `Luar Jawa ${((luarJawaPesanan/total)*100).toFixed(0)}% — ${luarJawaPesanan} pesanan` },
     ];
 
-    return { byProvinsi, byKota, highlights };
+    // Retur data per SKU
+    const returOrders = orders.filter(o => o.isRetur);
+    const returBySku = {};
+    returOrders.forEach(o => {
+      const key = o.produk || o.sku || "Unknown";
+      if (!returBySku[key]) returBySku[key] = { produk: key, count: 0, qty: 0, nilai: 0, variasi: [] };
+      returBySku[key].count++;
+      returBySku[key].qty += (o.returQty || o.qty || 1);
+      returBySku[key].nilai += (o.subtotal || 0);
+      if (o.variasi && !returBySku[key].variasi.includes(o.variasi)) returBySku[key].variasi.push(o.variasi);
+    });
+    const returData = Object.values(returBySku).sort((a,b) => b.qty - a.qty);
+
+    return { byProvinsi, byKota, highlights, returData };
   }, [snap]);
 
   const data = view === "provinsi" ? byProvinsi : byKota;
@@ -4923,6 +4972,46 @@ function AreaTab({ snap }) {
   return (
     <div>
       <SectionLabel>SEBARAN AREA · {snap.periodStart} → {snap.periodEnd} · {snap.orders.length} pesanan aktif</SectionLabel>
+
+      {/* Retur Summary */}
+      {snap.summary && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>RETUR & PENGEMBALIAN</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10, marginBottom: 12 }}>
+            {[
+              { label: "Retur (order)", value: `${snap.summary.returCount} order`, color: snap.summary.returRateOrder > 5 ? C.bad : snap.summary.returRateOrder > 2 ? C.watch : C.good, sub: `${snap.summary.returRateOrder.toFixed(1)}% dari order selesai` },
+              { label: "Retur (qty)", value: `${snap.summary.returQtyTotal} pcs`, color: C.ink, sub: "total unit dikembalikan" },
+              { label: "Nilai Retur", value: `Rp${(snap.summary.nilaiRetur/1e6).toFixed(2)}jt`, color: snap.summary.returRateNilai > 5 ? C.bad : snap.summary.returRateNilai > 2 ? C.watch : C.good, sub: `${snap.summary.returRateNilai.toFixed(2)}% dari GMV selesai` },
+              { label: "GMV Selesai", value: `Rp${(snap.summary.gmvSelesai/1e6).toFixed(1)}jt`, color: C.good, sub: `${snap.summary.selesaiCount} order selesai` },
+            ].map((k,i) => (
+              <div key={i} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, textTransform: "uppercase", marginBottom: 4 }}>{k.label}</div>
+                <div style={{ fontFamily: mono, fontSize: 16, fontWeight: 700, color: k.color, marginBottom: 2 }}>{k.value}</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.muted }}>{k.sub}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Retur per SKU */}
+          {returData.length > 0 && (
+            <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px", marginBottom: 8 }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, textTransform: "uppercase", marginBottom: 10 }}>RETUR PER PRODUK</div>
+              {returData.map((r, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: i < returData.length-1 ? `1px solid ${C.line}` : "none" }}>
+                  <div>
+                    <div style={{ fontFamily: sans, fontSize: 13, color: C.ink, fontWeight: 600 }}>{r.produk}</div>
+                    {r.variasi.length > 0 && <div style={{ fontFamily: sans, fontSize: 11, color: C.muted }}>{r.variasi.join(", ")}</div>}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontFamily: mono, fontSize: 13, color: C.bad, fontWeight: 700 }}>{r.qty} pcs</div>
+                    <div style={{ fontFamily: sans, fontSize: 11, color: C.muted }}>Rp{(r.nilai/1e3).toFixed(0)}rb</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Highlights */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10, marginBottom: 16 }}>
