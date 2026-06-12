@@ -9,7 +9,7 @@ import * as XLSX from "xlsx";
 
 /* ---------- IndexedDB (no deps) ------------------------------------------ */
 const DB_NAME = "nolkoma";
-const DB_VER = 15;
+const DB_VER = 16;
 function openDB() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(DB_NAME, DB_VER);
@@ -41,9 +41,20 @@ function openDB() {
         db.createObjectStore("tiktok_campaign", { keyPath: "id" }); // TikTok per-campaign/product
       if (!db.objectStoreNames.contains("pnl_inputs"))
         db.createObjectStore("pnl_inputs", { keyPath: "key" }); // P&L manual inputs
+      if (!db.objectStoreNames.contains("license"))
+        db.createObjectStore("license", { keyPath: "key" }); // Trial + Pro license
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(store, key) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store, "readonly");
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = () => res(req.result || null);
+    req.onerror = () => rej(req.error);
   });
 }
 async function idbPut(store, val) {
@@ -1268,22 +1279,163 @@ export default function Nolkoma() {
   const [snapshots, setSnapshots] = useState([]);
   const [products, setProducts] = useState([]);
   const [cogsMap, setCogsMap] = useState({});
-  const [cogsItems, setCogsItems] = useState([]); // [{sku, nama, hpp_prod, hpp_pack, hpp_lain, total, harga}]
-  const [metaSnaps, setMetaSnaps] = useState([]);   // Meta Ads snapshots
-  const [tiktokAdsSnaps, setTiktokAdsSnaps] = useState([]); // TikTok Ads (GMV Max) snapshots
-  const [tiktokCampaignSnap, setTiktokCampaignSnap] = useState(null); // TikTok per-campaign/product
-  const [pnlInputs, setPnlInputs] = useState({}); // P&L manual inputs
-  const [stockMap, setStockMap] = useState({}); // code -> units
+  const [cogsItems, setCogsItems] = useState([]);
+  const [metaSnaps, setMetaSnaps] = useState([]);
+  const [tiktokAdsSnaps, setTiktokAdsSnaps] = useState([]);
+  const [tiktokCampaignSnap, setTiktokCampaignSnap] = useState(null);
+  const [pnlInputs, setPnlInputs] = useState({});
+  const [stockMap, setStockMap] = useState({});
   const [thresholds, setThresholds] = useState(DEFAULT_TH);
   const [tab, setTab] = useState("overview");
   const [activeId, setActiveId] = useState(null);
   const [toast, setToast] = useState(null);
-  const [confirmDlg, setConfirmDlg] = useState(null); // { msg, onOk }
+  const [confirmDlg, setConfirmDlg] = useState(null);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const [panduanOpen, setPanduanOpen] = useState(false);
-  const [incomeSnaps, setIncomeSnaps] = useState([]);       // Shopee income
-  const [tiktokSnaps, setTiktokSnaps] = useState([]);       // TikTok income
-  const [orderSnaps, setOrderSnaps] = useState([]);           // Shopee Order export
+  const [incomeSnaps, setIncomeSnaps] = useState([]);
+  const [tiktokSnaps, setTiktokSnaps] = useState([]);
+  const [orderSnaps, setOrderSnaps] = useState([]);
+
+  // ── License / Trial state ──────────────────────────────────────────────────
+  const [licenseStatus, setLicenseStatus] = useState(null); // null=loading, "trial"|"pro"|"expired"
+  const [trialDaysLeft, setTrialDaysLeft] = useState(null);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const TRIAL_DAYS = 2;
+  const LYNK_MONTHLY = "https://lynk.id/hanifmhu/s/nolkoma-pro-bulanan";
+  const LYNK_LIFETIME = "https://lynk.id/hanifmhu/s/nolkoma-pro-selamanya";
+  const [exporting, setExporting] = useState(false);
+
+  async function exportPDF() {
+    if (licenseStatus !== "pro") { setShowUpgradeModal(true); return; }
+    setExporting(true);
+    showToast("Menyiapkan PDF...");
+    try {
+      // Load via script tag — works in both Vercel and browser environments
+      await new Promise((res, rej) => {
+        if (window.html2canvas) return res();
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+        s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+      await new Promise((res, rej) => {
+        if (window.jspdf) return res();
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+        s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+      const html2canvas = window.html2canvas;
+      const { jsPDF } = window.jspdf;
+      const el = document.getElementById("nolkoma-main-content");
+      if (!el) { showToast("Gagal export — konten tidak ditemukan."); setExporting(false); return; }
+      const canvas = await html2canvas(el, { scale: 1.5, useCORS: true, backgroundColor: "#F8F8FC", logging: false });
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 10;
+      const imgW = pageW - margin * 2;
+      const totalImgH = (canvas.height * imgW) / canvas.width;
+      const sliceHeightPx = Math.floor((pageH - margin * 2) / totalImgH * canvas.height);
+      let offsetY = 0; let pageNum = 0;
+      while (offsetY < canvas.height) {
+        const h = Math.min(sliceHeightPx, canvas.height - offsetY);
+        const sliceCanvas = document.createElement("canvas");
+        sliceCanvas.width = canvas.width; sliceCanvas.height = h;
+        sliceCanvas.getContext("2d").drawImage(canvas, 0, offsetY, canvas.width, h, 0, 0, canvas.width, h);
+        const sliceImgH = (h * imgW) / canvas.width;
+        if (pageNum > 0) pdf.addPage();
+        pdf.addImage(sliceCanvas.toDataURL("image/jpeg", 0.92), "JPEG", margin, margin, imgW, sliceImgH);
+        pdf.setFontSize(7); pdf.setTextColor(160, 160, 190);
+        pdf.text("nolkoma.com", pageW - margin, pageH - 4, { align: "right" });
+        offsetY += h; pageNum++;
+      }
+      const tabLabel = { overview:"Overview", strategy:"Strategi", fee:"Fee Marketplace", performance:"Performa Iklan", product:"Performa Produk", area:"Peta Distribusi", inventory:"Inventory", forecast:"Forecast", cogs:"COGS", unitec:"Unit Economics", cm:"Contribution Margin", pnl:"Simulasi LR" }[tab] || tab;
+      pdf.save(`Nolkoma_${tabLabel}_${new Date().toISOString().slice(0,10)}.pdf`);
+      showToast("PDF berhasil diexport.");
+    } catch(e) {
+      showToast("Gagal export: " + (e.message || "unknown error"));
+    } finally { setExporting(false); }
+  }
+
+  // Generate fingerprint from browser characteristics
+  function getFingerprint() {
+    const s = [
+      navigator.userAgent,
+      screen.width + "x" + screen.height,
+      Intl.DateTimeFormat().resolvedOptions().timeZone,
+      navigator.language,
+    ].join("|");
+    let h = 0;
+    for (let i = 0; i < s.length; i++) { h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; }
+    return Math.abs(h).toString(36);
+  }
+
+  // Validate license key — offline algorithm
+  // Format: NLK[T/P]-[BASE36_6]-[CHECKSUM_4]
+  // T = monthly (time-based), P = lifetime (permanent)
+  function validateKey(key) {
+    if (!key) return { valid: false };
+    const k = key.toUpperCase().trim();
+    const parts = k.split("-");
+    if (parts.length !== 3) return { valid: false };
+    const [prefix, body, checksum] = parts;
+    if (!/^NLK[TP]$/.test(prefix)) return { valid: false };
+    if (body.length !== 6 || checksum.length !== 4) return { valid: false };
+    // Verify checksum: sum of char codes of prefix+body mod 36^4, base36
+    const raw = prefix + body;
+    let sum = 0;
+    for (let i = 0; i < raw.length; i++) sum = (sum + raw.charCodeAt(i) * (i + 1)) % 1679616;
+    const expected = sum.toString(36).toUpperCase().padStart(4, "0");
+    if (checksum !== expected) return { valid: false };
+    return { valid: true, type: prefix[3] === "P" ? "lifetime" : "monthly" };
+  }
+
+  async function activateLicense(key) {
+    const result = validateKey(key);
+    if (!result.valid) return false;
+    await idbPut("license", { key: "licenseKey", value: key.toUpperCase().trim() });
+    await idbPut("license", { key: "licenseType", value: result.type });
+    await idbPut("license", { key: "activatedAt", value: Date.now() });
+    setLicenseStatus("pro");
+    setShowUpgradeModal(false);
+    showToast("✅ Nolkoma Pro aktif! Semua fitur terbuka.");
+    return true;
+  }
+
+  // Init trial on first load
+  useEffect(() => {
+    (async () => {
+      try {
+        // Check if already Pro
+        const licKey = await idbGet("license", "licenseKey");
+        if (licKey?.value) {
+          const result = validateKey(licKey.value);
+          if (result.valid) { setLicenseStatus("pro"); return; }
+        }
+        // Check/init trial
+        let trialRec = await idbGet("license", "trialStart");
+        if (!trialRec) {
+          const fp = getFingerprint();
+          await idbPut("license", { key: "trialStart", value: Date.now(), fingerprint: fp });
+          trialRec = { value: Date.now() };
+        }
+        const elapsed = Date.now() - trialRec.value;
+        const daysElapsed = elapsed / (1000 * 60 * 60 * 24);
+        const daysLeft = Math.max(0, Math.ceil(TRIAL_DAYS - daysElapsed));
+        if (daysLeft > 0) {
+          setLicenseStatus("trial");
+          setTrialDaysLeft(daysLeft);
+        } else {
+          setLicenseStatus("expired");
+          setShowUpgradeModal(true);
+        }
+      } catch (e) {
+        setLicenseStatus("trial");
+        setTrialDaysLeft(TRIAL_DAYS);
+      }
+    })();
+  }, []);
   const adFileRef = useRef();
   const prodFileRef = useRef();
   const incomeFileRef = useRef();
@@ -1721,12 +1873,34 @@ function parseOrderXlsx(buf) {
         </div>
         <div style={S.topActions}>
           {active && <span style={S.storeTag}>{active.store}</span>}
+          {/* Trial / Pro badge */}
+          {licenseStatus === "trial" && trialDaysLeft !== null && (
+            <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 20, background: "#FEF3C7", color: "#92400E", border: "1px solid #FDE68A", letterSpacing: 0.3 }}>
+              Trial · {trialDaysLeft} hari tersisa
+            </span>
+          )}
+          {licenseStatus === "pro" && (
+            <span style={{ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 20, background: "#DCFCE7", color: "#166534", border: "1px solid #BBF7D0", letterSpacing: 0.3 }}>
+              Pro ✓
+            </span>
+          )}
           <button
             style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, padding: "8px 14px", borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel2, color: C.muted, cursor: "pointer", letterSpacing: 0.3 }}
             onClick={() => setPanduanOpen(true)}>
             Panduan
           </button>
-          {/* Import button + dropdown */}
+          {/* Upgrade Pro button — only show during trial or expired */}
+          {(licenseStatus === "trial" || licenseStatus === "expired") && (
+            <button onClick={() => setShowUpgradeModal(true)}
+              style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 16px", borderRadius: 8, border: "none", background: C.accent, color: "#fff", cursor: "pointer", letterSpacing: 0.3 }}>
+              Upgrade Pro
+            </button>
+          )}
+          {/* Export PDF — always clickable, Pro only */}
+          <button onClick={exportPDF} disabled={exporting}
+            style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, padding: "8px 14px", borderRadius: 8, border: `1px solid ${C.line}`, background: C.panel, color: licenseStatus === "pro" ? C.accent : C.ink, cursor: "pointer", letterSpacing: 0.3 }}>
+            {exporting ? "Exporting..." : licenseStatus === "pro" ? "Export PDF" : "Export PDF 🔒"}
+          </button>
           <div style={{ position: "relative" }}>
             <button style={S.importBtn} onClick={() => setImportMenuOpen(v => !v)}>
               + Import Data {importMenuOpen ? "▲" : "▼"}
@@ -1821,6 +1995,7 @@ function parseOrderXlsx(buf) {
       </header>
 
       {panduanOpen && <PanduanModal onClose={() => setPanduanOpen(false)} onGoToOverview={() => { setPanduanOpen(false); setTab("overview"); }} />}
+      {showUpgradeModal && <UpgradeModal onActivate={activateLicense} lynkMonthly={LYNK_MONTHLY} lynkLifetime={LYNK_LIFETIME} onClose={licenseStatus === "expired" ? null : () => setShowUpgradeModal(false)} />}
       {(hasAds || hasProd) && (
         <div style={S.srcStrip}>
           <span style={S.srcChip}>
@@ -1871,7 +2046,22 @@ function parseOrderXlsx(buf) {
         ))}
       </nav>
 
-      <main style={S.main}>
+      <main id="nolkoma-main-content" style={S.main}>
+        {/* Expired enforcement — show locked overlay for non-overview tabs */}
+        {licenseStatus === "expired" && tab !== "overview" && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 400, gap: 16 }}>
+            <div style={{ fontSize: 40 }}>🔒</div>
+            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 700, color: C.ink }}>Tab ini terkunci</div>
+            <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, textAlign: "center", maxWidth: 320, lineHeight: 1.6 }}>
+              Trial 2 hari sudah selesai. Upgrade ke Nolkoma Pro untuk akses semua tab, diagnosa penuh, dan export PDF.
+            </div>
+            <button onClick={() => setShowUpgradeModal(true)}
+              style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: "#fff", background: C.accent, border: "none", borderRadius: 8, padding: "11px 24px", cursor: "pointer" }}>
+              Lihat Pilihan Pro
+            </button>
+          </div>
+        )}
+        {(licenseStatus !== "expired" || tab === "overview") && <>
         {!hasAds && !hasProd && ["overview","performance","strategy","forecast","cogs"].includes(tab) && <EmptyState onImportAds={() => adFileRef.current.click()} onImportProd={() => prodFileRef.current.click()} />}
         {hasAds && tab === "overview" && <Overview active={active} snapshots={snapshots} marginFor={marginFor} thresholds={thresholds} activeProducts={activeProducts} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} orderSnap={orderSnaps[0]||null} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} cogsItems={cogsItems} onGoToCogs={() => setTab("cogs")} />}
         {hasAds && tab === "performance" && <Performance active={active} marginFor={marginFor} thresholds={thresholds} saveThresholds={saveThresholds} activeProducts={activeProducts} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} tiktokCampaignSnap={tiktokCampaignSnap} onImportTiktokCampaign={() => tiktokCampaignFileRef.current.click()} />}
@@ -1931,6 +2121,7 @@ function parseOrderXlsx(buf) {
         {!hasAds && hasProd && tab !== "product" && (
           <div style={S.cmEmpty}>Tab ini butuh file iklan. Import <b>File Iklan (CSV)</b>, atau buka tab <b>Produk</b> untuk analisa dari file produk.</div>
         )}
+        </>}
       </main>
 
       {toast && <div style={S.toast}>{toast}</div>}
@@ -3873,6 +4064,108 @@ function FeeKpi({ label, value, color, sub, wide, highlight }) {
       <div style={{ fontFamily: mono, fontSize: 10, color: highlight ? (color || C.bad) : C.muted, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8, fontWeight: highlight ? 700 : 400 }}>{label}</div>
       <div style={{ fontFamily: mono, fontSize: highlight ? 24 : 20, fontWeight: 700, color: color || C.ink, lineHeight: 1.1 }}>{value}</div>
       {sub && <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, marginTop: 5 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/* ============================================================================
+   UPGRADE MODAL — Trial expired / paywall
+   ========================================================================== */
+function UpgradeModal({ onActivate, lynkMonthly, lynkLifetime, onClose }) {
+  const [keyInput, setKeyInput] = useState("");
+  const [keyError, setKeyError] = useState("");
+  const [activating, setActivating] = useState(false);
+
+  async function handleActivate() {
+    if (!keyInput.trim()) { setKeyError("Masukkan license key dulu."); return; }
+    setActivating(true); setKeyError("");
+    const ok = await onActivate(keyInput.trim());
+    if (!ok) { setKeyError("License key tidak valid. Periksa kembali penulisannya."); }
+    setActivating(false);
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.85)", backdropFilter: "blur(4px)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: "#fff", borderRadius: 16, padding: "32px 28px", maxWidth: 480, width: "100%", boxShadow: "0 24px 64px rgba(0,0,0,0.18)", position: "relative" }}>
+        {/* Close button — only during trial, not when expired */}
+        {onClose && (
+          <button onClick={onClose} style={{ position: "absolute", top: 14, right: 16, background: "none", border: "none", fontSize: 18, color: C.dim, cursor: "pointer", lineHeight: 1 }}>✕</button>
+        )}
+        {/* Header */}
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <div style={{ width: 52, height: 52, background: "#EEF2FF", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", fontSize: 24 }}>🔒</div>
+          <div style={{ fontFamily: sans, fontSize: 20, fontWeight: 800, color: C.ink, marginBottom: 8 }}>Trial 2 hari sudah selesai</div>
+          <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
+            Kamu sudah lihat insight dari data bulan ini.<br/>Upgrade untuk lanjut akses bulan depan dan seterusnya.
+          </div>
+        </div>
+
+        {/* Pricing cards */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 20 }}>
+          {/* Monthly */}
+          <a href={lynkMonthly} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+            <div style={{ border: `2px solid ${C.line}`, borderRadius: 12, padding: "16px 14px", cursor: "pointer", transition: "border-color 0.15s" }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = C.accent}
+              onMouseLeave={e => e.currentTarget.style.borderColor = C.line}>
+              <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.muted, letterSpacing: 1.2, marginBottom: 8 }}>BULANAN</div>
+              <div style={{ fontFamily: sans, fontSize: 22, fontWeight: 800, color: C.ink }}>Rp 89rb</div>
+              <div style={{ fontFamily: sans, fontSize: 11, color: C.muted, marginBottom: 12 }}>/bulan · cancel kapanpun</div>
+              <div style={{ fontFamily: sans, fontSize: 11, color: C.ink, lineHeight: 1.7 }}>
+                ✓ Semua fitur penuh<br/>
+                ✓ Export PDF<br/>
+                ✓ Konsultasi 30 menit gratis<br/>
+                ✓ Update rutin
+              </div>
+            </div>
+          </a>
+          {/* Lifetime */}
+          <a href={lynkLifetime} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+            <div style={{ border: `2px solid ${C.accent}`, borderRadius: 12, padding: "16px 14px", background: "#EEF2FF", cursor: "pointer", position: "relative" }}>
+              <div style={{ position: "absolute", top: -10, left: "50%", transform: "translateX(-50%)", background: C.accent, color: "#fff", fontFamily: mono, fontSize: 9, fontWeight: 700, padding: "3px 10px", borderRadius: 20, letterSpacing: 0.5, whiteSpace: "nowrap" }}>PALING WORTH</div>
+              <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.accent, letterSpacing: 1.2, marginBottom: 8 }}>SELAMANYA</div>
+              <div style={{ fontFamily: sans, fontSize: 22, fontWeight: 800, color: C.ink }}>Rp 399rb</div>
+              <div style={{ fontFamily: sans, fontSize: 11, color: C.muted, marginBottom: 12 }}>sekali bayar · semua update</div>
+              <div style={{ fontFamily: sans, fontSize: 11, color: C.ink, lineHeight: 1.7 }}>
+                ✓ Semua fitur penuh<br/>
+                ✓ Export PDF<br/>
+                ✓ Konsultasi 1 jam gratis<br/>
+                ✓ Semua update selamanya
+              </div>
+            </div>
+          </a>
+        </div>
+
+        {/* Konsultasi note */}
+        <div style={{ background: C.panel2, borderRadius: 8, padding: "10px 14px", marginBottom: 20, fontFamily: sans, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
+          💬 Butuh bantuan analisa data kamu? <span style={{ color: C.accent, fontWeight: 600 }}>Konsultasi 1 sesi — Rp 500.000</span> via WhatsApp. Bahas ROAS, fee, inventory, strategi scaling.
+        </div>
+
+        {/* Divider */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+          <div style={{ flex: 1, height: 1, background: C.line }} />
+          <div style={{ fontFamily: sans, fontSize: 11, color: C.dim }}>Sudah punya license key?</div>
+          <div style={{ flex: 1, height: 1, background: C.line }} />
+        </div>
+
+        {/* License key input */}
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={keyInput}
+            onChange={e => { setKeyInput(e.target.value.toUpperCase()); setKeyError(""); }}
+            placeholder="NLK-XXXXXX-XXXX"
+            style={{ flex: 1, fontFamily: mono, fontSize: 13, padding: "10px 12px", border: `1px solid ${keyError ? C.bad : C.line}`, borderRadius: 8, outline: "none", letterSpacing: 1 }}
+            onKeyDown={e => e.key === "Enter" && handleActivate()}
+          />
+          <button onClick={handleActivate} disabled={activating}
+            style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: "#fff", background: C.accent, border: "none", borderRadius: 8, padding: "10px 18px", cursor: "pointer", flexShrink: 0 }}>
+            {activating ? "..." : "Aktivasi"}
+          </button>
+        </div>
+        {keyError && <div style={{ fontFamily: sans, fontSize: 11, color: C.bad, marginTop: 6 }}>{keyError}</div>}
+        <div style={{ fontFamily: sans, fontSize: 11, color: C.dim, marginTop: 8, textAlign: "center" }}>
+          Setelah bayar di Lynk.id, license key dikirim via WhatsApp dalam 1×24 jam.
+        </div>
+      </div>
     </div>
   );
 }
