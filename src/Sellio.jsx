@@ -6598,7 +6598,7 @@ const S = {
   importBtnBig: { background: C.accent, color: "#fff", border: "none", padding: "12px 24px", borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: "pointer", marginTop: 18, boxShadow: "0 2px 6px rgba(129,140,248,0.3)" },
   importBtn2Big: { background: "transparent", color: C.accent, border: `1px solid ${C.accent}`, padding: "12px 24px", borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: "pointer", marginTop: 18 },
   resetBtn: { background: "transparent", color: C.muted, border: `1px solid ${C.line}`, padding: "8px 12px", borderRadius: 8, fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" },
-  importMenu: { position: "absolute", top: "calc(100% + 8px)", right: 0, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "8px", minWidth: 270, zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06)" },
+  importMenu: { position: "absolute", top: "calc(100% + 8px)", right: 0, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "8px", minWidth: 270, zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06)", maxHeight: "calc(100vh - 80px)", overflowY: "auto" },
   importMenuItem: { display: "flex", alignItems: "center", gap: 12, width: "100%", background: "transparent", border: "none", borderRadius: 8, padding: "10px 10px", cursor: "pointer", textAlign: "left" },
 
   // ── Source strip ──
