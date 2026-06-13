@@ -9,7 +9,7 @@ import * as XLSX from "xlsx";
 
 /* ---------- IndexedDB (no deps) ------------------------------------------ */
 const DB_NAME = "nolkoma";
-const DB_VER = 16;
+const DB_VER = 17;
 function openDB() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(DB_NAME, DB_VER);
@@ -43,6 +43,8 @@ function openDB() {
         db.createObjectStore("pnl_inputs", { keyPath: "key" }); // P&L manual inputs
       if (!db.objectStoreNames.contains("license"))
         db.createObjectStore("license", { keyPath: "key" }); // Trial + Pro license
+      if (!db.objectStoreNames.contains("tiktok_orders"))
+        db.createObjectStore("tiktok_orders", { keyPath: "id" }); // TikTok Semua Pesanan CSV
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -792,11 +794,24 @@ function parseTikTokIncomeXlsx(buf) {
   if (!sh) throw new Error("Sheet 'Detail pesanan' tidak ditemukan — pastikan file TikTok Shop yang benar.");
 
   function readSheetRows(sheet) {
-    const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:CB1000");
+    // TikTok files often have wrong <dimension ref> tag (e.g. A1:CB19 for 400+ rows)
+    // So we scan actual cell keys instead of trusting sheet["!ref"]
+    let maxR = 0, maxC = 0;
+    Object.keys(sheet).forEach(key => {
+      if (key[0] === "!") return;
+      const decoded = XLSX.utils.decode_cell(key);
+      if (decoded.r > maxR) maxR = decoded.r;
+      if (decoded.c > maxC) maxC = decoded.c;
+    });
+    // fallback to !ref if no cells found
+    if (maxR === 0) {
+      const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:CB1000");
+      maxR = range.e.r; maxC = range.e.c;
+    }
     const out = [];
-    for (let R = range.s.r; R <= range.e.r; R++) {
+    for (let R = 0; R <= maxR; R++) {
       const row = [];
-      for (let CC = range.s.c; CC <= range.e.c; CC++) {
+      for (let CC = 0; CC <= maxC; CC++) {
         const addr = XLSX.utils.encode_cell({ r: R, c: CC });
         const cell = sheet[addr];
         row.push(cell ? cell.v : "");
@@ -885,56 +900,209 @@ function parseTikTokIncomeXlsx(buf) {
   // ── 3. Use Laporan as authoritative source ──
   const hasLaporan = (laporan["Subtotal sebelum diskon"] || 0) > 0;
 
-  const gmvBruto       = hasLaporan ? laporan["Subtotal sebelum diskon"]         : orders.reduce((t,o) => t + o.subtotalBruto, 0);
-  const diskonPenjual  = hasLaporan ? laporan["Diskon penjual"]                  : orders.reduce((t,o) => t + o.diskonPenjual, 0);
-  const netGmv         = hasLaporan ? laporan["Subtotal setelah diskon penjual"] : gmvBruto + diskonPenjual;
-  const totalBiayaRaw  = hasLaporan ? Math.abs(laporan["Total Biaya"])           : Math.abs(orders.reduce((t,o) => t + o.totalBiaya, 0));
-  const komisiPlatform = hasLaporan ? Math.abs(laporan["Biaya komisi platform"]) : Math.abs(orders.reduce((t,o) => t + o.komisiPlatform, 0));
-  const komisiAfiliasi = hasLaporan ? Math.abs(laporan["Komisi Afiliasi"] || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiAfiliasi, 0));
-  const komisiDinamis  = hasLaporan ? Math.abs(laporan["Komisi dinamis"]  || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiDinamis, 0));
-  const biayaProses    = hasLaporan ? Math.abs(laporan["Biaya pemrosesan pesanan"] || 0) : Math.abs(orders.reduce((t,o) => t + o.biayaProses, 0));
-  const totalDilepas   = hasLaporan ? laporan["Jumlah penyelesaian pembayaran"]  : orders.reduce((t,o) => t + o.settlement, 0);
-  const adSpend        = adPayments.reduce((t,v) => t + v, 0);
+  const gmvBruto        = hasLaporan ? laporan["Subtotal sebelum diskon"]         : orders.reduce((t,o) => t + o.subtotalBruto, 0);
+  const diskonPenjual   = hasLaporan ? laporan["Diskon penjual"]                  : orders.reduce((t,o) => t + o.diskonPenjual, 0);
+  const netGmv          = hasLaporan ? laporan["Subtotal setelah diskon penjual"] : gmvBruto + diskonPenjual;
+  const totalBiayaRaw   = hasLaporan ? Math.abs(laporan["Total Biaya"])           : Math.abs(orders.reduce((t,o) => t + o.totalBiaya, 0));
+  const komisiPlatform  = hasLaporan ? Math.abs(laporan["Biaya komisi platform"]) : Math.abs(orders.reduce((t,o) => t + o.komisiPlatform, 0));
+  const komisiAfiliasi  = hasLaporan ? Math.abs(laporan["Komisi Afiliasi"] || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiAfiliasi, 0));
+  const komisiDinamis   = hasLaporan ? Math.abs(laporan["Komisi dinamis"]  || 0)  : Math.abs(orders.reduce((t,o) => t + o.komisiDinamis, 0));
+  const biayaProses     = hasLaporan ? Math.abs(laporan["Biaya pemrosesan pesanan"] || 0) : Math.abs(orders.reduce((t,o) => t + o.biayaProses, 0));
+  // Biaya eksklusif — TikTok "Biaya akses keuntungan eksklusif" (appears twice in laporan, take sum)
+  const biayaEksklusif  = hasLaporan ? Math.abs(laporan["Biaya akses keuntungan eksklusif"] || 0) : 0;
+  const totalDilepas    = hasLaporan ? laporan["Jumlah penyelesaian pembayaran"]  : orders.reduce((t,o) => t + o.settlement, 0);
+  const adSpend         = adPayments.reduce((t,v) => t + v, 0);
 
-  const refundValue    = hasLaporan
+  // Refund — from detail pesanan (more accurate for order count)
+  const refundOrders    = orders.filter(o => o.subtotalRefund < 0);
+  const refundValue     = hasLaporan
     ? Math.abs(laporan["Subtotal pengembalian dana sebelum diskon penjual"] || 0)
-    : orders.filter(o => o.subtotalRefund < 0).reduce((t,o) => t + Math.abs(o.subtotalRefund), 0);
-  const refundOrders   = orders.filter(o => o.subtotalRefund < 0);
+    : refundOrders.reduce((t,o) => t + Math.abs(o.subtotalRefund), 0);
+
+  // Order counts from detail pesanan
+  const normalOrders    = orders.filter(o => o.subtotalBruto > 0);
+  const totalOrderCount = normalOrders.length;
+  const refundOrderCount = refundOrders.length;
+  const refundRateOrder  = totalOrderCount > 0 ? (refundOrderCount / totalOrderCount) * 100 : 0;
+  const refundRateValue  = netGmv > 0 ? (refundValue / (gmvBruto || netGmv)) * 100 : 0;
 
   const summary = {
     channel: "tiktok",
     gmvBruto,
-    diskonPenjual: -Math.abs(diskonPenjual),
+    diskonPenjual:  -Math.abs(diskonPenjual),
     netGmv,
-    totalBiaya:     -totalBiayaRaw,
-    komisiPlatform: -komisiPlatform,
-    komisiAfiliasi: -komisiAfiliasi,
-    komisiDinamis:  -komisiDinamis,
-    biayaProses:    -biayaProses,
+    totalBiaya:      -totalBiayaRaw,
+    komisiPlatform:  -komisiPlatform,
+    komisiAfiliasi:  -komisiAfiliasi,
+    komisiDinamis:   -komisiDinamis,
+    biayaProses:     -biayaProses,
+    biayaEksklusif:  -biayaEksklusif,
     totalDilepas, adSpend,
-    refundOrderCount: null,       // not shown for TikTok — sample too small
+    refundOrderCount,
     refundValue,
-    totalOrderCount: null,         // not shown for TikTok — file only captures released orders
-    refundRateOrder: null,         // not shown for TikTok
-    refundRateValue: netGmv ? (refundValue / netGmv) * 100 : 0, // basis Net GMV
-    totalFee:       -totalBiayaRaw,
-    feeRateNetGmv:  netGmv   ? totalBiayaRaw / netGmv   * 100 : 0,
-    feeRateGross:   gmvBruto ? totalBiayaRaw / gmvBruto * 100 : 0,
-    takeRate:       netGmv   ? (1 - totalDilepas / netGmv) * 100 : 0,
-    hargaAsli: gmvBruto,
-    diskonProduk: -Math.abs(diskonPenjual),
-    refund: -refundValue,
-    voucherSeller: 0,
-    komisiAMS:    -komisiPlatform,
-    biayaAdmin:   -(komisiAfiliasi + komisiDinamis),
-    biayaLayanan: 0,
-    netGmv,
-    dataSource: hasLaporan ? "laporan" : "detail_pesanan",
+    totalOrderCount,
+    refundRateOrder,
+    refundRateValue,
+    totalFee:        -totalBiayaRaw,
+    feeRateNetGmv:   netGmv   ? totalBiayaRaw / netGmv   * 100 : 0,
+    feeRateGross:    gmvBruto ? totalBiayaRaw / gmvBruto * 100 : 0,
+    takeRate:        netGmv   ? (1 - totalDilepas / netGmv) * 100 : 0,
+    hargaAsli:       gmvBruto,
+    diskonProduk:   -Math.abs(diskonPenjual),
+    refund:          -refundValue,
+    voucherSeller:   0,
+    komisiAMS:       -komisiPlatform,
+    biayaAdmin:      -(komisiAfiliasi + komisiDinamis + biayaEksklusif),
+    biayaLayanan:    0,
+    dataSource:      hasLaporan ? "laporan" : "detail_pesanan",
   };
 
   return { channel: "tiktok", seller: "TikTok Shop", periodStart, periodEnd, summary, orders };
 }
 
+
+
+/* ============================================================================
+   TIKTOK ORDERS CSV PARSER
+   Source: TikTok Seller Center → Pesanan → Semua Pesanan → Export CSV
+   ========================================================================== */
+function parseTikTokOrdersCsv(text) {
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 2) throw new Error("File kosong.");
+
+  // Parse CSV header
+  const parseRow = (line) => {
+    const result = [];
+    let cur = "", inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ""; continue; }
+      cur += ch;
+    }
+    result.push(cur.trim());
+    return result;
+  };
+
+  const headers = parseRow(lines[0]);
+  const col = (name) => headers.indexOf(name);
+
+  const orders = [], skuRows = [];
+  let periodStart = "", periodEnd = "";
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const r = parseRow(lines[i]);
+    if (!r[col("Order ID")]) continue;
+
+    const status = (r[col("Order Status")] || "").trim();
+    const tgl = (r[col("Created Time")] || "").slice(0, 10).replace(/\//g, "-");
+    // Normalize date dd-mm-yyyy → yyyy-mm-dd
+    const tglNorm = tgl.match(/^\d{2}-\d{2}-\d{4}$/)
+      ? tgl.split("-").reverse().join("-") : tgl;
+
+    if (tglNorm && (!periodStart || tglNorm < periodStart)) periodStart = tglNorm;
+    if (tglNorm && (!periodEnd   || tglNorm > periodEnd))   periodEnd   = tglNorm;
+
+    const qty = parseInt(r[col("Quantity")] || "0", 10) || 0;
+    const hargaAsli = parseFloat(r[col("SKU Unit Original Price")] || "0") || 0;
+    const subtotalAfterDisc = parseFloat(r[col("SKU Subtotal After Discount")] || "0") || 0;
+    const diskonSeller = parseFloat(r[col("SKU Seller Discount")] || "0") || 0;
+    const productName = (r[col("Product Name")] || "").trim();
+    const sku = (r[col("Seller SKU")] || "").trim();
+    const variation = (r[col("Variation")] || "").trim();
+    const provinsi = (r[col("Province")] || "").trim();
+    const kota = (r[col("Regency and City")] || "").trim()
+      .replace(/^(KOTA |KAB\. |KAB )/i, "");
+    const cancelReason = (r[col("Cancel Reason")] || "").trim();
+
+    skuRows.push({
+      orderId: r[col("Order ID")],
+      status, tgl: tglNorm,
+      productName, sku, variation, qty,
+      hargaAsli, subtotalAfterDisc, diskonSeller,
+      provinsi, kota, cancelReason,
+    });
+  }
+
+  // Aggregate by order
+  const orderMap = {};
+  skuRows.forEach(row => {
+    if (!orderMap[row.orderId]) {
+      orderMap[row.orderId] = {
+        orderId: row.orderId, status: row.status, tgl: row.tgl,
+        provinsi: row.provinsi, kota: row.kota,
+        totalQty: 0, totalGmv: 0, totalHargaAsli: 0,
+        skus: [],
+      };
+    }
+    const o = orderMap[row.orderId];
+    o.totalQty += row.qty;
+    o.totalGmv += row.subtotalAfterDisc;
+    o.totalHargaAsli += row.hargaAsli * row.qty;
+    o.skus.push({ sku: row.sku, productName: row.productName, variation: row.variation, qty: row.qty, harga: row.hargaAsli, subtotal: row.subtotalAfterDisc });
+  });
+
+  orders.push(...Object.values(orderMap));
+  const selesai = orders.filter(o => o.status === "Selesai");
+  const batal   = orders.filter(o => o.status === "Dibatalkan");
+
+  // SKU performance
+  const skuMap = {};
+  skuRows.filter(r => r.status === "Selesai").forEach(r => {
+    const key = r.sku || r.productName;
+    if (!skuMap[key]) skuMap[key] = { sku: key, productName: r.productName, qty: 0, gmv: 0, orders: new Set() };
+    skuMap[key].qty += r.qty;
+    skuMap[key].gmv += r.subtotalAfterDisc;
+    skuMap[key].orders.add(r.orderId);
+  });
+  const skuPerf = Object.values(skuMap).map(s => ({ ...s, orders: s.orders.size }))
+    .sort((a, b) => b.qty - a.qty);
+
+  // Variation (size/color) performance
+  const varMap = {};
+  skuRows.filter(r => r.status === "Selesai" && r.variation).forEach(r => {
+    if (!varMap[r.variation]) varMap[r.variation] = { variation: r.variation, qty: 0 };
+    varMap[r.variation].qty += r.qty;
+  });
+  const varPerf = Object.values(varMap).sort((a, b) => b.qty - a.qty);
+
+  // Area
+  const provMap = {}, kotaMap = {};
+  selesai.forEach(o => {
+    if (o.provinsi) { provMap[o.provinsi] = (provMap[o.provinsi] || 0) + 1; }
+    if (o.kota)     { kotaMap[o.kota]     = (kotaMap[o.kota]     || 0) + 1; }
+  });
+  const topProv = Object.entries(provMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,count])=>({name,count}));
+  const topKota = Object.entries(kotaMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,count])=>({name,count}));
+
+  // Color extraction from variation/product name
+  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","hitam","putih","abu","biru","merah","hijau","coklat","krem","sand","stone","light","dark","sage","rust","terracotta","teal","mint","burgundy","caramel","charcoal"];
+  const colorMap = {};
+  skuRows.filter(r => r.status === "Selesai").forEach(r => {
+    const text = ((r.productName || "") + " " + (r.variation || "")).toLowerCase();
+    colorWords.forEach(c => {
+      if (text.includes(c)) colorMap[c] = (colorMap[c] || 0) + r.qty;
+    });
+  });
+  const topColors = Object.entries(colorMap).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([color,count])=>({color,count}));
+
+  const totalGmv = selesai.reduce((t,o) => t + o.totalGmv, 0);
+
+  return {
+    channel: "tiktok_orders",
+    periodStart, periodEnd,
+    orders, skuRows,
+    summary: {
+      totalOrders: orders.length,
+      selesaiOrders: selesai.length,
+      batalOrders: batal.length,
+      cancelRate: orders.length ? (batal.length / orders.length * 100) : 0,
+      totalGmv, totalQty: selesai.reduce((t,o) => t + o.totalQty, 0),
+    },
+    skuPerf, varPerf, topProv, topKota, topColors,
+  };
+}
 
 
 /* ============================================================================
@@ -1598,6 +1766,7 @@ export default function Nolkoma() {
   const [metaSnaps, setMetaSnaps] = useState([]);
   const [tiktokAdsSnaps, setTiktokAdsSnaps] = useState([]);
   const [tiktokCampaignSnap, setTiktokCampaignSnap] = useState(null);
+  const [tiktokOrdersSnap, setTiktokOrdersSnap] = useState(null);
   const [pnlInputs, setPnlInputs] = useState({});
   const [stockMap, setStockMap] = useState({});
   const [thresholds, setThresholds] = useState(DEFAULT_TH);
@@ -1719,6 +1888,7 @@ export default function Nolkoma() {
   const metaFileRef = useRef();
   const tiktokAdsFileRef = useRef();
   const tiktokCampaignFileRef = useRef();
+  const tiktokOrdersFileRef = useRef();
 
   useEffect(() => {
     (async () => {
@@ -1761,6 +1931,8 @@ export default function Nolkoma() {
       setTiktokAdsSnaps(tiktokAds);
       const ttCamps = await idbAll("tiktok_campaign");
       if (ttCamps.length > 0) setTiktokCampaignSnap(ttCamps[ttCamps.length - 1]);
+      const ttOrders = await idbAll("tiktok_orders");
+      if (ttOrders.length > 0) setTiktokOrdersSnap(ttOrders[ttOrders.length - 1]);
       const pnlRecs = await idbAll("pnl_inputs");
       const pnlMap = {};
       pnlRecs.forEach(r => { pnlMap[r.key] = r.value; });
@@ -1800,14 +1972,14 @@ export default function Nolkoma() {
     // confirm handled by caller via confirmDlg
     const unused = false; if (unused) return;
     const db = await openDB();
-    await Promise.all(["snapshots","products","cogs","stock","settings","income","income_tiktok","orders","cogs_items","meta_ads","tiktok_ads","pnl_inputs"].map(store =>
+    await Promise.all(["snapshots","products","cogs","stock","settings","income","income_tiktok","orders","cogs_items","meta_ads","tiktok_ads","tiktok_campaign","tiktok_orders","pnl_inputs"].map(store =>
       new Promise((res, rej) => {
         const tx = db.transaction(store, "readwrite");
         tx.objectStore(store).clear();
         tx.oncomplete = res; tx.onerror = rej;
       })
     ));
-    setSnapshots([]); setProducts([]); setCogsMap({}); setStockMap({}); setIncomeSnaps([]); setTiktokSnaps([]); setOrderSnaps([]); setCogsItems([]); setMetaSnaps([]); setTiktokAdsSnaps([]); setTiktokCampaignSnap(null); setPnlInputs({});
+    setSnapshots([]); setProducts([]); setCogsMap({}); setStockMap({}); setIncomeSnaps([]); setTiktokSnaps([]); setOrderSnaps([]); setCogsItems([]); setMetaSnaps([]); setTiktokAdsSnaps([]); setTiktokCampaignSnap(null); setTiktokOrdersSnap(null); setPnlInputs({});
     setActiveId(null); setThresholds(DEFAULT_TH);
     flash("Semua data direset.");
   }
@@ -1905,6 +2077,24 @@ export default function Nolkoma() {
     }
     e.target.value = "";
   }
+
+  async function handleTikTokOrdersFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+      const text = await f.text();
+      const parsed = parseTikTokOrdersCsv(text);
+      parsed.id = "tiktok_orders|" + Date.now();
+      await new Promise((res,rej) => { openDB().then(db => { const tx=db.transaction("tiktok_orders","readwrite"); tx.objectStore("tiktok_orders").clear(); tx.oncomplete=res; tx.onerror=rej; }); });
+      await idbPut("tiktok_orders", parsed);
+      setTiktokOrdersSnap(parsed);
+      flash(`TikTok Orders: ${parsed.summary.selesaiOrders} selesai · ${parsed.summary.batalOrders} batal · GMV ${rpShort(parsed.summary.totalGmv)}`);
+    } catch(err) {
+      flash("Gagal baca file TikTok Orders: " + err.message);
+    }
+    e.target.value = "";
+  }
+
 
   async function handleMetaFile(e) {
     const f = e.target.files?.[0];
@@ -2282,7 +2472,7 @@ function parseOrderXlsx(buf) {
                 <div style={{ fontFamily: sans, fontSize: 10, fontWeight: 700, color: C.dim, letterSpacing: 1, textTransform: "uppercase", padding: "4px 10px" }}>Data Keuangan</div>
                 {[
                   { label: "Penghasilan Shopee", sub: "Shopee → Keuangan → Penghasilan Saya → Download", icon: "🟠", action: () => incomeFileRef.current.click(), accent: "#f96d00" },
-                  { label: "Penghasilan TikTok", sub: "TikTok Shop → Keuangan → Pendapatan → Download", icon: "⚫", action: () => tiktokFileRef.current.click(), accent: C.muted },
+                  { label: "Penghasilan TikTok", sub: "TikTok Seller Center → Keuangan → Transaksi → Tipe: Penghasilan → Unduh → Pilih Periode → Download", icon: "⚫", action: () => tiktokFileRef.current.click(), accent: C.muted },
                 ].map((item, i) => (
                   <button key={i} style={S.importMenuItem} onClick={() => { item.action(); setImportMenuOpen(false); }}>
                     <span style={{ fontSize: 16, lineHeight: 1, minWidth: 20 }}>{item.icon}</span>
@@ -2300,6 +2490,7 @@ function parseOrderXlsx(buf) {
                 {[
                   { label: "Produk Shopee", sub: "Shopee → Bisnis Saya → Performa Produk → Export", icon: "📦", action: () => prodFileRef.current.click(), accent: C.good },
                   { label: "Pesanan Shopee", sub: "Shopee → Pesanan → Export Pesanan → XLSX", icon: "📍", action: () => orderFileRef.current.click(), accent: "#a29bfe" },
+                  { label: "Semua Pesanan TikTok", sub: "TikTok Seller Center → Pesanan → Semua Pesanan → Export CSV", icon: "🛍", action: () => tiktokOrdersFileRef.current.click(), accent: "#fe2c55" },
                 ].map((item, i) => (
                   <button key={i} style={S.importMenuItem} onClick={() => { item.action(); setImportMenuOpen(false); }}>
                     <span style={{ fontSize: 16, lineHeight: 1, minWidth: 20 }}>{item.icon}</span>
@@ -2342,6 +2533,7 @@ function parseOrderXlsx(buf) {
           <input ref={metaFileRef} type="file" accept=".csv" hidden onChange={handleMetaFile} />
           <input ref={tiktokAdsFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleTikTokAdsFile} />
           <input ref={tiktokCampaignFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleTikTokCampaignFile} />
+          <input ref={tiktokOrdersFileRef} type="file" accept=".csv" hidden onChange={handleTikTokOrdersFile} />
         </div>
       </header>
 
@@ -2390,15 +2582,66 @@ function parseOrderXlsx(buf) {
         </div>
       )}
 
-      {/* tabs */}
-      <nav data-noprint style={S.tabs}>
-        {[["overview", "Overview"], ["strategy", "Strategi"], ["fee", "Fee Marketplace"], ["performance", "Performa Iklan"], ["product", "Performa Produk"], ["inventory", "Analisa Inventory"], ["forecast", "Forecast Target"], ["cogs", "COGS / Margin"], ["area", "Peta Distribusi"], ["unitec", "Unit Economics"], ["cm", "Contribution Margin"], ["pnl", "Simulasi L/R"]].map(([k, lbl]) => (
-          <button key={k} onClick={() => setTab(k)}
-            style={{ ...S.tab, ...(tab === k ? S.tabActive : {}) }}>{lbl}</button>
-        ))}
-      </nav>
+      {/* ── SIDEBAR + CONTENT LAYOUT ── */}
+      <div style={{ display:"flex", minHeight:"calc(100vh - 120px)" }}>
 
-      <main id="nolkoma-main-content" style={S.main}>
+        {/* SIDEBAR */}
+        <nav data-noprint style={{
+          width: 220, flexShrink: 0, background: C.panel,
+          borderRight: `1px solid ${C.line}`,
+          padding: "16px 0", position: "sticky",
+          top: 0, height: "100vh", overflowY: "auto",
+          display: "flex", flexDirection: "column", gap: 2,
+        }}>
+          {[
+            { group: "ANALITIK UTAMA", items: [
+              { k:"overview",     lbl:"Overview",              icon:"ti ti-layout-dashboard" },
+              { k:"performance",  lbl:"Performa Iklan",        icon:"ti ti-chart-bar" },
+              { k:"product",      lbl:"Performa Produk",       icon:"ti ti-package" },
+              { k:"fee",          lbl:"Fee Marketplace",       icon:"ti ti-receipt" },
+              { k:"strategy",     lbl:"Strategi",              icon:"ti ti-bulb" },
+            ]},
+            { group: "PENGELOLAAN", items: [
+              { k:"inventory",    lbl:"Analisa Inventory",     icon:"ti ti-box" },
+              { k:"cogs",         lbl:"COGS / Margin",         icon:"ti ti-calculator" },
+              { k:"area",         lbl:"Peta Distribusi",       icon:"ti ti-map-pin" },
+            ]},
+            { group: "SIMULASI", items: [
+              { k:"forecast",     lbl:"Forecast Target",       icon:"ti ti-target" },
+              { k:"unitec",       lbl:"Unit Economics",        icon:"ti ti-coin" },
+              { k:"cm",           lbl:"Contribution Margin",   icon:"ti ti-percentage" },
+              { k:"pnl",          lbl:"Simulasi Laba Rugi",    icon:"ti ti-trending-up" },
+            ]},
+          ].map(({ group, items }) => (
+            <div key={group}>
+              <div style={{ fontFamily:mono, fontSize:9, fontWeight:700, color:C.dim,
+                letterSpacing:1.2, padding:"12px 20px 6px", textTransform:"uppercase" }}>
+                {group}
+              </div>
+              {items.map(({ k, lbl, icon }) => {
+                const isActive = tab === k;
+                return (
+                  <button key={k} onClick={() => setTab(k)} style={{
+                    display:"flex", alignItems:"center", gap:10, width:"100%", textAlign:"left",
+                    fontFamily:sans, fontSize:13, fontWeight:isActive?700:400,
+                    padding:"9px 16px",
+                    borderLeft:`3px solid ${isActive ? C.accent : "transparent"}`,
+                    background:isActive ? C.accent+"15" : "transparent",
+                    color:isActive ? C.accent : C.muted,
+                    border:"none", borderLeft:`3px solid ${isActive ? C.accent : "transparent"}`,
+                    cursor:"pointer", transition:"all 0.1s",
+                  }}>
+                    <i className={icon} style={{ fontSize:16, flexShrink:0, opacity: isActive ? 1 : 0.6 }} />
+                    {lbl}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
+
+        {/* MAIN CONTENT */}
+        <main id="nolkoma-main-content" style={{ ...S.main, flex:1, minWidth:0 }}>
         {/* Expired enforcement — show locked overlay for non-overview tabs */}
         {licenseStatus === "expired" && tab !== "overview" && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 400, gap: 16 }}>
@@ -2415,10 +2658,10 @@ function parseOrderXlsx(buf) {
         )}
         {(licenseStatus !== "expired" || tab === "overview") && <>
         {!hasAds && !hasProd && ["overview","performance","strategy","forecast","cogs"].includes(tab) && <EmptyState onImportAds={() => adFileRef.current.click()} onImportProd={() => prodFileRef.current.click()} />}
-        {hasAds && tab === "overview" && <Overview active={active} snapshots={snapshots} marginFor={marginFor} thresholds={thresholds} activeProducts={activeProducts} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} orderSnap={orderSnaps[0]||null} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} cogsItems={cogsItems} onGoToCogs={() => setTab("cogs")} />}
-        {hasAds && tab === "performance" && <Performance active={active} marginFor={marginFor} thresholds={thresholds} saveThresholds={saveThresholds} activeProducts={activeProducts} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} tiktokCampaignSnap={tiktokCampaignSnap} onImportTiktokCampaign={() => tiktokCampaignFileRef.current.click()} />}
-        {tab === "product" && (hasProd
-          ? <ProductTab snap={activeProducts} thresholds={thresholds} active={active} feeRate={(incomeSnaps[0]?.summary?.feeRateNetGmv) || (tiktokSnaps[0]?.summary?.feeRateNetGmv) || 0} />
+        {hasAds && tab === "overview" && <Overview active={active} snapshots={snapshots} marginFor={marginFor} thresholds={thresholds} activeProducts={activeProducts} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} orderSnap={orderSnaps[0]||null} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} tiktokOrdersSnap={tiktokOrdersSnap} cogsItems={cogsItems} onGoToCogs={() => setTab("cogs")} onGoToArea={() => setTab("area")} onGoToProduct={() => setTab("product")} />}
+        {hasAds && tab === "performance" && <Performance active={active} snapshots={snapshots} marginFor={marginFor} thresholds={thresholds} saveThresholds={saveThresholds} activeProducts={activeProducts} metaSnap={metaSnaps[0]||null} tiktokAdsSnap={tiktokAdsSnaps[0]||null} tiktokCampaignSnap={tiktokCampaignSnap} onImportTiktokCampaign={() => tiktokCampaignFileRef.current.click()} />}
+        {tab === "product" && (hasProd || tiktokOrdersSnap
+          ? <ProductTab snap={activeProducts} tiktokOrdersSnap={tiktokOrdersSnap} orderSnap={orderSnaps[0]||null} thresholds={thresholds} active={active} feeRate={(incomeSnaps[0]?.summary?.feeRateNetGmv) || (tiktokSnaps[0]?.summary?.feeRateNetGmv) || 0} onImportTiktok={() => tiktokOrdersFileRef.current.click()} />
           : <ProductEmpty onImport={() => prodFileRef.current.click()} />)}
         {tab === "inventory" && (hasProd
           ? <InventoryTab snap={activeProducts} active={active} thresholds={thresholds} stockMap={stockMap} setStockMap={setStockMap} />
@@ -2454,8 +2697,8 @@ function parseOrderXlsx(buf) {
         {tab === "fee" && (incomeSnaps.length > 0 || tiktokSnaps.length > 0
           ? <FeeTab shopeeSnap={incomeSnaps[0] || null} tiktokSnap={tiktokSnaps[0] || null} />
           : <FeeEmpty onImportShopee={() => incomeFileRef.current.click()} onImportTiktok={() => tiktokFileRef.current.click()} />)}
-        {tab === "area" && (orderSnaps.length > 0
-          ? <AreaTab snap={orderSnaps[0]} />
+        {tab === "area" && (orderSnaps.length > 0 || tiktokOrdersSnap
+          ? <AreaTab snap={orderSnaps[0]||null} tiktokOrdersSnap={tiktokOrdersSnap} onImportShopee={() => orderFileRef.current.click()} onImportTiktok={() => tiktokOrdersFileRef.current.click()} />
           : <AreaEmpty onImport={() => orderFileRef.current.click()} />)}
         {tab === "unitec" && <UnitEconomicsTab active={active} activeProducts={activeProducts} cogsItems={cogsItems} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} onDownloadTemplate={() => generateCOGSTemplate()} onImportCogs={() => cogsFileRef.current.click()} />}
         {tab === "cm" && <ContribMarginTab active={active} activeProducts={activeProducts} cogsItems={cogsItems} shopeeSnap={incomeSnaps[0]||null} tiktokSnap={tiktokSnaps[0]||null} onDownloadTemplate={() => generateCOGSTemplate()} onImportCogs={() => cogsFileRef.current.click()} />}
@@ -2475,6 +2718,7 @@ function parseOrderXlsx(buf) {
         )}
         </>}
       </main>
+      </div>{/* end sidebar+content wrapper */}
 
       {/* Footer */}
       <footer data-noprint style={{ background: C.ink, padding: "32px 40px 24px", marginTop: 40 }}>
@@ -2533,7 +2777,7 @@ function EmptyState({ onImportAds, onImportProd }) {
     { num: "01", label: "File Iklan (CSV)", desc: "Shopee Ads → Laporan → Data Keseluruhan Iklan", color: C.accent, action: null, btnLabel: null },
     { num: "02", label: "File Produk (XLSX)", desc: "Shopee → Bisnis Saya → Performa Produk → Export", color: C.good, action: null, btnLabel: null },
     { num: "03", label: "Penghasilan Shopee (XLSX)", desc: "Shopee → Keuangan → Penghasilan Saya → Download", color: "#f96d00", action: null, btnLabel: null },
-    { num: "04", label: "Penghasilan TikTok (XLSX)", desc: "TikTok Shop → Keuangan → Pendapatan → Download", color: C.muted, action: null, btnLabel: null },
+    { num: "04", label: "Penghasilan TikTok (XLSX)", desc: "TikTok Seller Center → Keuangan → Transaksi → Tipe: Penghasilan → Unduh → Pilih Periode → Download", color: C.muted, action: null, btnLabel: null },
     { num: "05", label: "Template COGS / HPP", desc: "Download template dari Import Data, isi HPP per SKU, import balik", color: C.good, action: null, btnLabel: null },
   ];
   return (
@@ -2582,414 +2826,470 @@ function aggregate(ads) {
 }
 
 /* ---------- Overview ------------------------------------------------------ */
-function Overview({ active, snapshots, marginFor, thresholds, activeProducts, shopeeSnap, tiktokSnap, orderSnap, metaSnap, tiktokAdsSnap, cogsItems, onGoToCogs }) {
+function Overview({ active, snapshots, marginFor, thresholds, activeProducts, shopeeSnap, tiktokSnap, orderSnap, metaSnap, tiktokAdsSnap, tiktokOrdersSnap, cogsItems, onGoToCogs, onGoToArea, onGoToProduct }) {
   const agg = useMemo(() => aggregate(active.ads), [active]);
-
-  // ad dependency: ad-attributed GMV vs total product sales (if product file present)
-  const adDep = useMemo(() => {
-    if (!activeProducts) return null;
-    const totalSales = activeProducts.products.reduce((t, p) => t + p.sales, 0);
-    if (!totalSales) return null;
-    return { adGmv: agg.gmv, totalSales, pct: Math.min(100, (agg.gmv / totalSales) * 100) };
-  }, [activeProducts, agg]);
-
-  // contribution margin = GMV*margin% - spend, where margin known
-  const cm = useMemo(() => {
-    let knownGmv = 0, grossProfit = 0, unknown = 0;
-    active.ads.forEach((ad) => {
-      const m = marginFor(ad);
-      if (m == null) { unknown += ad.gmv; return; }
-      knownGmv += ad.gmv;
-      grossProfit += ad.gmv * (m / 100);
-    });
-    const contribution = grossProfit - active.ads.reduce((t, ad) => t + (marginFor(ad) != null ? ad.spend : 0), 0);
-    return { knownGmv, grossProfit, contribution, unknown };
-  }, [active, marginFor]);
-
-  // trend vs previous snapshot
   const prev = snapshots.filter((s) => s.endTs < active.endTs).sort((a, b) => b.endTs - a.endTs)[0];
   const prevAgg = prev ? aggregate(prev.ads) : null;
-  const delta = (cur, p) => (p ? ((cur - p) / p) * 100 : null);
-
-  // ── derived data for new sections ──
+  const delta = (cur, p) => (p && p !== 0 ? ((cur - p) / p) * 100 : null);
   const safeNum = v => (typeof v === "number" && !isNaN(v) ? v : 0);
+
+  // ── Data derivations ──
   const sh = shopeeSnap?.summary;
   const tt = tiktokSnap?.summary;
   const totalNetGmv  = safeNum(sh?.netGmv) + safeNum(tt?.netGmv);
   const totalFee     = safeNum(sh?.totalFee) + safeNum(tt?.totalFee);
-  const adGmv        = active ? active.ads.reduce((t,a) => t+a.gmv, 0) : 0;
-  const shopeeSpend  = active ? active.ads.reduce((t,a) => t+a.spend, 0) : 0;
+  const shopeeSpend  = active.ads.reduce((t, a) => t + a.spend, 0);
   const ttAdsSpend   = tiktokAdsSnap?.summary?.totalSpend || 0;
   const metaSpend    = metaSnap?.summary?.totalSpend || 0;
   const totalAdSpend = shopeeSpend + ttAdsSpend + metaSpend;
+  const adGmv        = active.ads.reduce((t, a) => t + a.gmv, 0);
   const cogsOk       = cogsItems && cogsItems.length > 0;
+  const metaGmv      = metaSnap?.summary?.totalRevenue || 0;
+  const ttAdsGmv     = tiktokAdsSnap?.summary?.totalGmv || 0;
 
-  // Daily sales from order file
-  const dailySales = useMemo(() => {
-    if (!orderSnap) return [];
-    const map = {};
-    orderSnap.orders.forEach(o => {
-      if (!o.tglDibuat) return;
-      const d = o.tglDibuat.slice(0,10);
-      if (!map[d]) map[d] = { tgl: d, pesanan: 0, pcs: 0 };
-      map[d].pesanan++; map[d].pcs += o.jumlah;
-    });
-    return Object.values(map).sort((a,b) => a.tgl < b.tgl ? -1 : 1);
-  }, [orderSnap]);
+  // Blended ROAS
+  const totalAdsGmv  = adGmv + ttAdsGmv + metaGmv;
+  const blendedRoas  = totalAdSpend > 0 ? totalAdsGmv / totalAdSpend : 0;
 
-  // Top 5 kota & provinsi from order file
-  const { topKota, topProv } = useMemo(() => {
-    if (!orderSnap) return { topKota: [], topProv: [] };
-    const kt = {}, pv = {};
-    orderSnap.orders.forEach(o => {
-      kt[o.kota] = (kt[o.kota]||0) + 1;
-      pv[o.provinsi] = (pv[o.provinsi]||0) + 1;
+  // Contribution margin
+  const cmData = useMemo(() => {
+    let grossProfit = 0, adSpendKnown = 0, knownGmv = 0, unknownGmv = 0;
+    active.ads.forEach(ad => {
+      const m = marginFor(ad);
+      if (m != null) {
+        grossProfit += ad.gmv * (m / 100);
+        adSpendKnown += ad.spend;
+        knownGmv += ad.gmv;
+      } else {
+        unknownGmv += ad.gmv;
+      }
     });
-    const topKota = Object.entries(kt).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([n,c])=>({name:n,count:c}));
-    const topProv = Object.entries(pv).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([n,c])=>({name:n,count:c}));
-    return { topKota, topProv };
-  }, [orderSnap]);
+    const cm = grossProfit - adSpendKnown;
+    return { cm, knownGmv, unknownGmv, grossProfit };
+  }, [active, marginFor]);
 
-  // Top 5 customers
-  const topCustomers = useMemo(() => {
-    if (!orderSnap) return [];
-    const map = {};
-    orderSnap.orders.forEach(o => {
-      const u = o.skuInduk ? o.skuInduk : "unknown"; // use a buyer field
-      // Actually order snap has no buyer username — skip for now, use kota as proxy
-    });
-    // Parse from raw — orderSnap.orders has no buyer field currently
-    return [];
-  }, [orderSnap]);
+  // Waterfall: use income data if available
+  const wfGmv     = totalNetGmv > 0 ? totalNetGmv : adGmv;
+  const wfFee     = Math.abs(totalFee);
+  const wfAdSpend = totalAdSpend;
+  const wfHpp     = cogsOk ? active.ads.reduce((t,a) => {
+    const m = marginFor(a);
+    return t + (m != null ? a.gmv * ((100 - m) / 100) : 0);
+  }, 0) : 0;
+  const wfLabaKotor  = wfGmv - wfFee - wfHpp;
+  const wfLabaBersih = wfLabaKotor - wfAdSpend;
 
-  // Top colors from order Nama Variasi
-  const topColors = useMemo(() => {
-    if (!orderSnap) return [];
-    const map = {};
-    const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","hitam","putih","abu","biru","merah","hijau","coklat","krem"];
-    orderSnap.orders.forEach(o => {
-      if (!o.namaProduk) return;
-      const lower = o.namaProduk.toLowerCase();
-      colorWords.forEach(c => {
-        if (lower.includes(c)) map[c] = (map[c]||0) + o.jumlah;
-      });
-    });
-    return Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([c,n])=>({color:c,count:n}));
-  }, [orderSnap]);
+  // Trend arrows
+  const TrendBadge = ({ val, invert }) => {
+    if (val === null || val === undefined) return null;
+    const positive = invert ? val < 0 : val > 0;
+    const color = positive ? C.good : C.bad;
+    const icon = val > 0 ? "▲" : "▼";
+    return (
+      <span style={{ fontSize: 10, fontWeight: 700, color, marginLeft: 4 }}>
+        {icon} {Math.abs(val).toFixed(1)}%
+      </span>
+    );
+  };
+
+  // Alert engine
+  const alerts = useMemo(() => {
+    const list = [];
+    // Low ROAS ads
+    const lowRoas = active.ads.filter(a => a.roas < thresholds.targetRoas && a.spend > 0);
+    if (lowRoas.length > 0) list.push({ type: "warn", icon: "⚠", title: `${lowRoas.length} iklan ROAS di bawah ${thresholds.targetRoas}x`, desc: "Pertimbangkan pause & audit creative atau audience" });
+    // No COGS
+    if (!cogsOk) list.push({ type: "info", icon: "💡", title: "COGS belum diisi", desc: "Contribution margin tidak akurat tanpa data HPP" });
+    // High ad dependency
+    if (activeProducts) {
+      const totalSales = activeProducts.products.reduce((t,p) => t + p.sales, 0);
+      const pct = totalSales > 0 ? (adGmv / totalSales) * 100 : 0;
+      if (pct > 70) list.push({ type: "warn", icon: "📊", title: `${pct.toFixed(0)}% penjualan dari iklan`, desc: "Organik tipis — rawan kalau spend dipotong" });
+    }
+    // Good ROAS
+    const goodAds = active.ads.filter(a => a.roas >= thresholds.targetRoas * 1.5 && a.spend > 0);
+    if (goodAds.length > 0) list.push({ type: "good", icon: "🚀", title: `${goodAds.length} iklan siap di-scale`, desc: `ROAS ≥ ${(thresholds.targetRoas * 1.5).toFixed(1)}x — naikkan budget bertahap` });
+    return list.slice(0, 4);
+  }, [active, thresholds, cogsOk, activeProducts, adGmv]);
+
+  // Styles for this component
+  const ov = {
+    secLabel: { fontFamily: mono, fontSize: 10, fontWeight: 700, color: C.dim, letterSpacing: 1, textTransform: "uppercase", marginBottom: 10, marginTop: 20 },
+    kpiGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 },
+    kpiCard: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px" },
+    kpiLabel: { fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 0.6, marginBottom: 6 },
+    kpiVal: { fontFamily: mono, fontSize: 19, fontWeight: 700, color: C.ink, lineHeight: 1 },
+    kpiSub: { fontFamily: sans, fontSize: 11, color: C.muted, marginTop: 4 },
+    chGrid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 },
+    chCard: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px" },
+    chRow: { display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "3px 0" },
+    chLabel: { fontFamily: sans, fontSize: 11, color: C.muted },
+    chVal: { fontFamily: mono, fontSize: 12, fontWeight: 700 },
+    barWrap: { height: 4, background: C.panel2, borderRadius: 2, overflow: "hidden", marginTop: 10 },
+    wfCard: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 20px" },
+    wfRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: `0.5px solid ${C.line}` },
+    wfLabel: { fontFamily: sans, fontSize: 13, color: C.muted, display: "flex", alignItems: "center", gap: 8 },
+    wfVal: { fontFamily: mono, fontSize: 13, fontWeight: 700 },
+    alertGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+    alertCard: { borderRadius: 10, padding: "12px 14px", display: "flex", gap: 10, alignItems: "flex-start" },
+  };
+
+  const alertColors = {
+    warn:  { bg: C.watch + "18", border: C.watch, title: C.watch, desc: C.watch + "cc" },
+    bad:   { bg: C.bad   + "12", border: C.bad,   title: C.bad,   desc: C.bad   + "cc" },
+    good:  { bg: C.good  + "12", border: C.good,  title: C.good,  desc: C.good  + "cc" },
+    info:  { bg: C.accent+ "12", border: C.accent, title: C.accent, desc: C.accent + "cc" },
+  };
 
   return (
     <div>
-      {/* 1. REVENUE AKTUAL */}
-      {(shopeeSnap || tiktokSnap) && (
+      {/* ── 1. KPI RINGKASAN ── */}
+      <div style={ov.secLabel}>Ringkasan bisnis · {active.periodStart} → {active.periodEnd}</div>
+      <div style={ov.kpiGrid}>
+        {/* Total GMV */}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.accent}` }}>
+          <div style={ov.kpiLabel}>Total net GMV</div>
+          <div style={{ ...ov.kpiVal, color: C.accent }}>{totalNetGmv > 0 ? rpShort(totalNetGmv) : rpShort(adGmv)}</div>
+          {prevAgg && <div style={ov.kpiSub}>vs prev <TrendBadge val={delta(totalNetGmv || adGmv, prevAgg.gmv)} /></div>}
+        </div>
+        {/* Fee Rate */}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.bad}` }}>
+          <div style={ov.kpiLabel}>Fee marketplace</div>
+          <div style={{ ...ov.kpiVal, color: C.bad }}>{rpShort(wfFee)}</div>
+          {totalNetGmv > 0 && <div style={ov.kpiSub}>{(wfFee / totalNetGmv * 100).toFixed(1)}% dari GMV</div>}
+        </div>
+        {/* Total Ad Spend */}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.watch}` }}>
+          <div style={ov.kpiLabel}>Total ad spend</div>
+          <div style={{ ...ov.kpiVal, color: C.watch }}>{rpShort(totalAdSpend)}</div>
+          <div style={ov.kpiSub}>Shopee{tiktokAdsSnap ? " + TikTok" : ""}{metaSnap ? " + Meta" : ""}</div>
+        </div>
+        {/* Blended ROAS */}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${blendedRoas >= thresholds.targetRoas ? C.good : C.bad}` }}>
+          <div style={ov.kpiLabel}>Blended ROAS</div>
+          <div style={{ ...ov.kpiVal, color: blendedRoas >= thresholds.targetRoas ? C.good : C.bad }}>{blendedRoas > 0 ? blendedRoas.toFixed(2) + "x" : agg.roas.toFixed(2) + "x"}</div>
+          <div style={ov.kpiSub}>Target {thresholds.targetRoas}x</div>
+        </div>
+        {/* GMV dari Iklan */}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.accent}` }}>
+          <div style={ov.kpiLabel}>GMV dari iklan</div>
+          <div style={{ ...ov.kpiVal, color: C.ink }}>{rpShort(totalAdsGmv || adGmv)}</div>
+          {totalNetGmv > 0 && <div style={ov.kpiSub}>{((totalAdsGmv || adGmv) / totalNetGmv * 100).toFixed(0)}% dari total GMV</div>}
+        </div>
+        {/* CM atau COGS prompt */}
+        {cogsOk
+          ? (
+            <div style={{ ...ov.kpiCard, borderTop: `3px solid ${cmData.cm >= 0 ? C.good : C.bad}` }}>
+              <div style={ov.kpiLabel}>Contribution margin</div>
+              <div style={{ ...ov.kpiVal, color: cmData.cm >= 0 ? C.good : C.bad }}>{rpShort(cmData.cm)}</div>
+              <div style={ov.kpiSub}>setelah ads & COGS</div>
+            </div>
+          )
+          : (
+            <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.watch}`, cursor: "pointer" }} onClick={onGoToCogs}>
+              <div style={ov.kpiLabel}>Contribution margin</div>
+              <div style={{ ...ov.kpiVal, fontSize: 14, color: C.watch }}>Isi COGS →</div>
+              <div style={ov.kpiSub}>Klik untuk unlock CM</div>
+            </div>
+          )
+        }
+      </div>
+
+      {/* ── 2. CHANNEL BREAKDOWN ── */}
+      {(sh || tt || metaSnap) && (
         <>
-          <SectionLabel>REVENUE AKTUAL · SEMUA CHANNEL</SectionLabel>
-          <DataDisclaimer />
-          <div style={S.kpiGrid}>
-            <Kpi label="Total Net GMV" value={rpShort(totalNetGmv)} dir="rev" accent={C.accent} big />
-            {totalNetGmv > 0 && <Kpi label="Fee Rate Marketplace" value={(Math.abs(totalFee)/totalNetGmv*100).toFixed(1)+"%"} dir="cost" accent={C.bad} />}
-            <Kpi label="Total Fee Marketplace" value={rpShort(Math.abs(totalFee))} dir="cost" accent={C.bad} />
-            {sh && <Kpi label="Shopee GMV" value={rpShort(sh.netGmv||0)} dir="rev" accent={C.accent} />}
-            {tt && <Kpi label="TikTok GMV" value={rpShort(tt.netGmv||0)} dir="rev" accent={"#fe2c55"} />}
-            {active && <Kpi label="Revenue dari Iklan" value={rpShort(adGmv)} dir="rev" accent={C.muted} />}
-            {totalAdSpend > 0 && <Kpi label="Total Ad Spending" value={rpShort(totalAdSpend)} dir="cost" accent={C.watch} />}
-            {cogsOk
-              ? <Kpi label="COGS Coverage" value={cogsItems.length+" SKU"} dir="neutral" accent={C.good} />
-              : <div style={{ background: C.panel, border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "13px 15px", cursor: "pointer", borderTop: `3px solid ${C.watch}` }} onClick={onGoToCogs}>
-                  <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, letterSpacing: 0.8, marginBottom: 6 }}>COGS / UNIT ECONOMICS</div>
-                  <div style={{ fontFamily: mono, fontSize: 13, color: C.watch }}>Belum diisi →</div>
-                  <div style={{ fontFamily: sans, fontSize: 11, color: C.dim, marginTop: 3 }}>Klik untuk isi COGS & unlock CM</div>
+          <div style={ov.secLabel}>Channel breakdown</div>
+          <div style={ov.chGrid}>
+            {/* Shopee */}
+            {sh && (
+              <div style={ov.chCard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#F97316", flexShrink: 0 }} />
+                  <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>Shopee</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
                 </div>
-            }
+                <div style={ov.chRow}><span style={ov.chLabel}>Net GMV</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(sh.netGmv || 0)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Fee platform</span><span style={{ ...ov.chVal, color: C.bad }}>-{rpShort(Math.abs(sh.totalFee || 0))}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Ad spend</span><span style={{ ...ov.chVal, color: C.watch }}>-{rpShort(shopeeSpend)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>ROAS iklan</span><span style={{ ...ov.chVal, color: agg.roas >= thresholds.targetRoas ? C.good : C.bad }}>{agg.roas.toFixed(2)}x</span></div>
+                <div style={ov.barWrap}><div style={{ height: "100%", width: Math.min(100, (sh.netGmv || 0) / Math.max(totalNetGmv, 1) * 100) + "%", background: "#F97316", borderRadius: 2 }} /></div>
+              </div>
+            )}
+            {/* TikTok */}
+            {tt && (
+              <div style={ov.chCard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#010101", flexShrink: 0 }} />
+                  <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>TikTok Shop</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
+                </div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Net GMV</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(tt.netGmv || 0)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Fee platform</span><span style={{ ...ov.chVal, color: C.bad }}>-{rpShort(Math.abs(tt.totalFee || 0))}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Ad spend</span><span style={{ ...ov.chVal, color: C.watch }}>-{rpShort(ttAdsSpend)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>ROAS GMV Max</span><span style={{ ...ov.chVal, color: tiktokAdsSnap?.summary?.roas >= thresholds.targetRoas ? C.good : C.bad }}>{tiktokAdsSnap ? (tiktokAdsSnap.summary?.roas || 0).toFixed(2) + "x" : "-"}</span></div>
+                <div style={ov.barWrap}><div style={{ height: "100%", width: Math.min(100, (tt.netGmv || 0) / Math.max(totalNetGmv, 1) * 100) + "%", background: "#010101", borderRadius: 2 }} /></div>
+              </div>
+            )}
+            {/* Meta */}
+            {metaSnap && (
+              <div style={ov.chCard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#1877f2", flexShrink: 0 }} />
+                  <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>Meta Ads</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
+                </div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Spend</span><span style={{ ...ov.chVal, color: C.watch }}>-{rpShort(metaSpend)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>GMV attributed</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(metaGmv)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>CTR rata-rata</span><span style={{ ...ov.chVal, color: C.ink }}>{metaSnap.summary?.ctr ? metaSnap.summary.ctr.toFixed(2) + "%" : "-"}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>ROAS</span><span style={{ ...ov.chVal, color: metaSnap.summary?.roas >= thresholds.targetRoas ? C.good : C.bad }}>{metaSnap.summary?.roas ? metaSnap.summary.roas.toFixed(2) + "x" : "-"}</span></div>
+                <div style={ov.barWrap}><div style={{ height: "100%", width: Math.min(100, metaGmv / Math.max(totalNetGmv || adGmv, 1) * 100) + "%", background: "#1877f2", borderRadius: 2 }} /></div>
+              </div>
+            )}
+            {/* Shopee Ads only (no income snap) */}
+            {!sh && !tt && (
+              <div style={ov.chCard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#F97316", flexShrink: 0 }} />
+                  <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>Shopee Ads</span>
+                </div>
+                <div style={ov.chRow}><span style={ov.chLabel}>GMV dari iklan</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(adGmv)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Ad spend</span><span style={{ ...ov.chVal, color: C.watch }}>-{rpShort(shopeeSpend)}</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>ROAS</span><span style={{ ...ov.chVal, color: agg.roas >= thresholds.targetRoas ? C.good : C.bad }}>{agg.roas.toFixed(2)}x</span></div>
+                <div style={ov.chRow}><span style={ov.chLabel}>Konversi</span><span style={{ ...ov.chVal, color: C.ink }}>{nfmt(agg.conv)}</span></div>
+              </div>
+            )}
           </div>
+        </>
+      )}
 
-          {/* Daily sales chart */}
-          {dailySales.length > 0 && (() => {
-            const maxPesanan = Math.max(...dailySales.map(d=>d.pesanan), 1);
-            return (
-              <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px", marginTop: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
-                  <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1 }}>DAILY ORDERS · SHOPEE{tt ? "" : " ONLY"}</div>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.dim }}>{orderSnap.periodStart} → {orderSnap.periodEnd}</div>
-                </div>
-                {(() => {
-                  const W = 900, H = 72, pad = 4;
-                  const minV = 0, maxV = maxPesanan;
-                  const pts = dailySales.map((d, i) => {
-                    const x = pad + (i / Math.max(dailySales.length-1,1)) * (W - pad*2);
-                    const y = H - pad - ((d.pesanan - minV) / Math.max(maxV - minV, 1)) * (H - pad*2);
-                    return `${x},${y}`;
-                  }).join(" ");
-                  const areaBottom = dailySales.map((d, i) => {
-                    const x = pad + (i / Math.max(dailySales.length-1,1)) * (W - pad*2);
-                    return `${x},${H-pad}`;
-                  });
-                  const areaPath = `M ${pts.split(" ")[0]} L ${pts.split(" ").join(" L ")} L ${areaBottom.reverse().join(" L ")} Z`;
-                  return (
-                    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:72, overflow:"visible" }} preserveAspectRatio="none">
-                      <defs>
-                        <linearGradient id="lineGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor={C.accent} stopOpacity="0.3"/>
-                          <stop offset="100%" stopColor={C.accent} stopOpacity="0.02"/>
-                        </linearGradient>
-                      </defs>
-                      <path d={areaPath} fill="url(#lineGrad)" />
-                      <polyline points={pts} fill="none" stroke={C.accent} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-                      {dailySales.map((d, i) => {
-                        const x = pad + (i / Math.max(dailySales.length-1,1)) * (W - pad*2);
-                        const y = H - pad - ((d.pesanan - minV) / Math.max(maxV - minV, 1)) * (H - pad*2);
-                        return d.pesanan === maxPesanan
-                          ? <circle key={i} cx={x} cy={y} r="4" fill={C.accent} stroke={C.panel} strokeWidth="2" />
-                          : null;
-                      })}
-                    </svg>
-                  );
-                })()}
-                <div style={{ display:"flex", justifyContent:"space-between", marginTop:5, fontFamily:mono, fontSize:10, color:C.dim }}>
-                  <span>{dailySales[0]?.tgl?.slice(5)}</span>
-                  <span style={{ color:C.muted }}>{orderSnap.orders.length} pesanan total · {orderSnap.orders.reduce((t,o)=>t+o.jumlah,0)} pcs</span>
-                  <span>{dailySales[dailySales.length-1]?.tgl?.slice(5)}</span>
-                </div>
+      {/* ── 3. WATERFALL ARUS DANA ── */}
+      {(wfGmv > 0 || wfFee > 0 || wfAdSpend > 0) && (
+        <>
+          <div style={ov.secLabel}>Arus dana · waterfall</div>
+          <div style={ov.wfCard}>
+            {[
+              { label: "GMV / Penerimaan bersih", val: wfGmv, color: C.accent, bold: false },
+              ...(wfFee > 0 ? [{ label: "Fee marketplace", val: -wfFee, color: C.bad }] : []),
+              ...(wfHpp > 0 ? [{ label: "HPP / COGS", val: -wfHpp, color: C.bad }] : []),
+              ...(wfFee > 0 || wfHpp > 0 ? [{ label: "Laba kotor", val: wfLabaKotor, color: wfLabaKotor >= 0 ? C.good : C.bad, bold: true, sep: true }] : []),
+              ...(wfAdSpend > 0 ? [{ label: "Total biaya iklan", val: -wfAdSpend, color: C.bad }] : []),
+              { label: "Laba bersih (estimasi)", val: wfLabaBersih, color: wfLabaBersih >= 0 ? C.good : C.bad, bold: true, final: true },
+            ].map((row, i) => (
+              <div key={i} style={{
+                ...ov.wfRow,
+                ...(row.final ? { borderBottom: "none", background: C.panel2, margin: "0 -20px", padding: "10px 20px", borderRadius: "0 0 10px 10px" } : {}),
+                ...(row.sep ? { borderTop: `1px solid ${C.line}`, marginTop: 4, paddingTop: 10 } : {}),
+              }}>
+                <span style={{ ...ov.wfLabel, fontWeight: row.bold ? 700 : 400, color: row.bold ? C.ink : C.muted }}>
+                  {row.final ? "👑 " : row.val < 0 ? "— " : "  "}{row.label}
+                </span>
+                <span style={{ ...ov.wfVal, color: row.color }}>
+                  {row.val >= 0 ? rpShort(row.val) : "-" + rpShort(Math.abs(row.val))}
+                </span>
               </div>
-            );
-          })()}
+            ))}
+          </div>
+        </>
+      )}
 
-          {/* Top 5 area + colors */}
-          {orderSnap && (topKota.length > 0 || topProv.length > 0) && (
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginTop:10 }}>
-              {/* Top Provinsi */}
-              <div style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"12px 14px" }}>
-                <div style={{ fontFamily:mono, fontSize:10, color:C.muted, letterSpacing:1, marginBottom:10 }}>TOP 5 PROVINSI</div>
-                {topProv.map((p,i) => (
-                  <div key={i} style={{ marginBottom:8 }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                      <span style={{ fontFamily:sans, fontSize:12, fontWeight:i<3?700:400 }}>{p.name}</span>
-                      <span style={{ fontFamily:mono, fontSize:12, color:C.accent }}>{p.count}</span>
-                    </div>
-                    <div style={{ height:4, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
-                      <div style={{ width:(p.count/topProv[0].count*100)+"%", height:"100%", background:[C.accent,C.good,C.watch,C.muted,C.dim][i]||C.dim, borderRadius:2 }} />
-                    </div>
+      {/* ── 4. ADS PERFORMANCE MINI ── */}
+      <div style={ov.secLabel}>Performa iklan · {active.ads.length} iklan</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.watch}` }}>
+          <div style={ov.kpiLabel}>Shopee Ads spend</div>
+          <div style={{ ...ov.kpiVal, fontSize: 16, color: C.watch }}>{rpShort(shopeeSpend)}</div>
+          <div style={ov.kpiSub}>{active.ads.length} iklan aktif</div>
+        </div>
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${agg.roas >= thresholds.targetRoas ? C.good : C.bad}` }}>
+          <div style={ov.kpiLabel}>ROAS Shopee</div>
+          <div style={{ ...ov.kpiVal, fontSize: 16, color: agg.roas >= thresholds.targetRoas ? C.good : C.bad }}>{agg.roas.toFixed(2)}x</div>
+          <div style={ov.kpiSub}>ACOS {agg.acos.toFixed(1)}%</div>
+        </div>
+        {tiktokAdsSnap && (
+          <div style={{ ...ov.kpiCard, borderTop: `3px solid #fe2c55` }}>
+            <div style={ov.kpiLabel}>TikTok GMV Max</div>
+            <div style={{ ...ov.kpiVal, fontSize: 16, color: "#fe2c55" }}>{rpShort(ttAdsSpend)}</div>
+            <div style={ov.kpiSub}>ROAS {(tiktokAdsSnap.summary?.roas || 0).toFixed(2)}x</div>
+          </div>
+        )}
+        {metaSnap && (
+          <div style={{ ...ov.kpiCard, borderTop: `3px solid #1877f2` }}>
+            <div style={ov.kpiLabel}>Meta Ads spend</div>
+            <div style={{ ...ov.kpiVal, fontSize: 16, color: "#1877f2" }}>{rpShort(metaSpend)}</div>
+            <div style={ov.kpiSub}>CTR {metaSnap.summary?.ctr ? metaSnap.summary.ctr.toFixed(2) + "%" : "-"}</div>
+          </div>
+        )}
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.muted}` }}>
+          <div style={ov.kpiLabel}>CVR rata-rata</div>
+          <div style={{ ...ov.kpiVal, fontSize: 16, color: C.ink }}>{agg.cvr.toFixed(2)}%</div>
+          <div style={ov.kpiSub}>{nfmt(agg.conv)} konversi</div>
+        </div>
+        <div style={{ ...ov.kpiCard, borderTop: `3px solid ${C.muted}` }}>
+          <div style={ov.kpiLabel}>CPA</div>
+          <div style={{ ...ov.kpiVal, fontSize: 16, color: C.ink }}>{rpShort(agg.cpa)}</div>
+          <div style={ov.kpiSub}>biaya per konversi</div>
+        </div>
+      </div>
+
+      {/* ── 5. ALERT & REKOMENDASI ── */}
+      {alerts.length > 0 && (
+        <>
+          <div style={ov.secLabel}>Alert & rekomendasi</div>
+          <div style={ov.alertGrid}>
+            {alerts.map((a, i) => {
+              const col = alertColors[a.type] || alertColors.info;
+              return (
+                <div key={i} style={{ ...ov.alertCard, background: col.bg, border: `1px solid ${col.border}` }}>
+                  <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>{a.icon}</span>
+                  <div>
+                    <div style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, color: col.title, marginBottom: 2 }}>{a.title}</div>
+                    <div style={{ fontFamily: sans, fontSize: 11, color: col.desc }}>{a.desc}</div>
                   </div>
-                ))}
-              </div>
-              {/* Top Kota */}
-              <div style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"12px 14px" }}>
-                <div style={{ fontFamily:mono, fontSize:10, color:C.muted, letterSpacing:1, marginBottom:10 }}>TOP 5 KOTA</div>
-                {topKota.map((p,i) => (
-                  <div key={i} style={{ marginBottom:8 }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                      <span style={{ fontFamily:sans, fontSize:12, fontWeight:i<3?700:400 }}>{p.name.replace("KOTA ","").replace("KAB. ","")}</span>
-                      <span style={{ fontFamily:mono, fontSize:12, color:C.good }}>{p.count}</span>
-                    </div>
-                    <div style={{ height:4, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
-                      <div style={{ width:(p.count/topKota[0].count*100)+"%", height:"100%", background:[C.good,C.accent,C.watch,C.muted,C.dim][i]||C.dim, borderRadius:2 }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {/* Top Warna */}
-              {topColors.length > 0 && (
-                <div style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"12px 14px" }}>
-                  <div style={{ fontFamily:mono, fontSize:10, color:C.muted, letterSpacing:1, marginBottom:10 }}>TOP WARNA (dari nama produk)</div>
-                  {topColors.map((p,i) => (
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {/* ── 6. DAILY ORDERS CHART (jika ada order data) ── */}
+      {orderSnap && (() => {
+        const dailySales = (() => {
+          const map = {};
+          orderSnap.orders.forEach(o => {
+            if (!o.tglDibuat) return;
+            const d = o.tglDibuat.slice(0,10);
+            if (!map[d]) map[d] = { tgl: d, pesanan: 0, pcs: 0 };
+            map[d].pesanan++; map[d].pcs += o.jumlah;
+          });
+          return Object.values(map).sort((a,b) => a.tgl < b.tgl ? -1 : 1);
+        })();
+        if (!dailySales.length) return null;
+        const maxV = Math.max(...dailySales.map(d => d.pesanan), 1);
+        const W = 900, H = 64, pad = 4;
+        const pts = dailySales.map((d,i) => {
+          const x = pad + (i / Math.max(dailySales.length-1,1)) * (W-pad*2);
+          const y = H - pad - ((d.pesanan) / maxV) * (H-pad*2);
+          return `${x},${y}`;
+        }).join(" ");
+        return (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px", marginTop: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1 }}>DAILY ORDERS</div>
+              <div style={{ fontFamily: mono, fontSize: 11, color: C.dim }}>{orderSnap.orders.length} pesanan · {orderSnap.orders.reduce((t,o)=>t+o.jumlah,0)} pcs</div>
+            </div>
+            <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:64, overflow:"visible" }} preserveAspectRatio="none">
+              <polyline points={pts} fill="none" stroke={C.accent} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            </svg>
+            <div style={{ display:"flex", justifyContent:"space-between", marginTop:4, fontFamily:mono, fontSize:10, color:C.dim }}>
+              <span>{dailySales[0]?.tgl?.slice(5)}</span>
+              <span>{dailySales[dailySales.length-1]?.tgl?.slice(5)}</span>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── 7. TOP AREA gabungan semua platform ── */}
+      {(orderSnap || tiktokOrdersSnap) && (() => {
+        const kt = {}, pv = {};
+        // Shopee orders
+        (orderSnap?.orders || []).forEach(o => {
+          const k = (o.kota||"").replace(/^(KOTA |KAB\. |KAB )/i,"");
+          const p = (o.provinsi||"").toUpperCase();
+          if (k) kt[k] = (kt[k]||0) + 1;
+          if (p) pv[p] = (pv[p]||0) + 1;
+        });
+        // TikTok orders (selesai only)
+        (tiktokOrdersSnap?.orders || []).filter(o => o.status==="Selesai").forEach(o => {
+          const k = (o.kota||"").replace(/^(KOTA |KAB\. |KAB )/i,"");
+          const p = (o.provinsi||"").toUpperCase();
+          if (k) kt[k] = (kt[k]||0) + 1;
+          if (p) pv[p] = (pv[p]||0) + 1;
+        });
+        const topKota = Object.entries(kt).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([n,c])=>({name:n,count:c}));
+        const topProv = Object.entries(pv).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([n,c])=>({name:n,count:c}));
+        if (!topKota.length && !topProv.length) return null;
+        const hasMulti = orderSnap && tiktokOrdersSnap;
+        return (
+          <div style={{ marginTop:10 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+              <div style={{ fontFamily:mono, fontSize:10, color:C.dim, letterSpacing:1, textTransform:"uppercase" }}>Top Area {hasMulti?"· Shopee + TikTok":"· "+( orderSnap?"Shopee":"TikTok")}</div>
+              {onGoToArea && <button onClick={onGoToArea} style={{ fontFamily:mono, fontSize:10, color:C.accent, background:"none", border:"none", cursor:"pointer" }}>lihat semua →</button>}
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              {[{ title:"TOP PROVINSI", data:topProv, color:C.accent }, { title:"TOP KOTA", data:topKota, color:C.good }].map(({ title, data, color }) => (
+                <div key={title} style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:10, padding:"12px 14px" }}>
+                  <div style={{ fontFamily:mono, fontSize:10, color:C.dim, letterSpacing:1, marginBottom:10 }}>{title}</div>
+                  {data.map((p,i) => (
                     <div key={i} style={{ marginBottom:8 }}>
                       <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                        <span style={{ fontFamily:sans, fontSize:12, fontWeight:i<3?700:400, textTransform:"capitalize" }}>{p.color}</span>
-                        <span style={{ fontFamily:mono, fontSize:12, color:C.watch }}>{p.count} pcs</span>
+                        <span style={{ fontFamily:sans, fontSize:12, fontWeight:i<3?700:400 }}>{p.name?.replace("KOTA ","").replace("KAB. ","")}</span>
+                        <span style={{ fontFamily:mono, fontSize:12, color }}>{p.count}</span>
                       </div>
                       <div style={{ height:4, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
-                        <div style={{ width:(p.count/topColors[0].count*100)+"%", height:"100%", background:[C.watch,C.accent,C.good,C.muted,C.dim,C.bad][i]||C.dim, borderRadius:2 }} />
+                        <div style={{ width:(p.count/data[0].count*100)+"%", height:"100%", background:color, borderRadius:2 }} />
                       </div>
                     </div>
                   ))}
                 </div>
-              )}
-            </div>
-          )}
-        </>
-      )}
-
-      {/* 2. PERFORMA IKLAN */}
-      <SectionLabel>PERFORMA IKLAN · {active.periodStart} → {active.periodEnd}</SectionLabel>
-      <div style={S.kpiGrid}>
-        <Kpi label="Spend Shopee Ads" value={rpShort(shopeeSpend)} dir="cost" accent={C.watch} />
-        {tiktokAdsSnap && <Kpi label="Spend TikTok GMV Max" value={rpShort(ttAdsSpend)} dir="cost" accent={"#fe2c55"} />}
-        {metaSnap && <Kpi label="Spend Meta Ads" value={rpShort(metaSpend)} dir="cost" accent={"#1877f2"} />}
-        <Kpi label="GMV dari Iklan" value={rpShort(agg.gmv)} sub={prevAgg ? deltaStr(delta(agg.gmv, prevAgg.gmv)) : null} dir="rev" accent={C.accent} />
-        <Kpi label="ROAS Shopee" value={agg.roas.toFixed(2) + "x"} sub={prevAgg ? deltaStr(delta(agg.roas, prevAgg.roas)) : null} dir="rev" big accent={agg.roas >= thresholds.targetRoas ? C.good : C.bad} />
-        <Kpi label="ACOS" value={agg.acos.toFixed(1) + "%"} dir="cost" accent={C.watch} />
-        <Kpi label="Konversi" value={nfmt(agg.conv)} dir="rev" accent={C.good} />
-        <Kpi label="CVR" value={agg.cvr.toFixed(2) + "%"} dir="neutral" accent={C.muted} />
-        <Kpi label="CPA" value={rpShort(agg.cpa)} dir="cost" accent={C.muted} />
-      </div>
-
-      {/* 3. KETERGANTUNGAN IKLAN */}
-      {adDep && (
-        <>
-          <SectionLabel>KETERGANTUNGAN IKLAN</SectionLabel>
-          <div style={S.cmRow}>
-            <div style={S.cmCard}>
-              <div style={S.cmLabel}>Penjualan total (semua channel)</div>
-              <div style={S.cmVal}>{rp(adDep.totalSales)}</div>
-            </div>
-            <div style={S.cmCard}>
-              <div style={S.cmLabel}>GMV dari iklan</div>
-              <div style={S.cmVal}>{rp(adDep.adGmv)}</div>
-            </div>
-            <div style={{ ...S.cmCard, ...S.cmCardFinal }}>
-              <div style={S.cmLabel}>% penjualan via iklan</div>
-              <div style={{ ...S.cmVal, color: adDep.pct > 70 ? C.watch : C.good }}>{adDep.pct.toFixed(0)}%</div>
-            </div>
-            <div style={S.cmNote}>
-              {adDep.pct > 70
-                ? `⚠ ${adDep.pct.toFixed(0)}% penjualan bergantung iklan  -  organik tipis, rawan kalau spend dipotong.`
-                : `${(100 - adDep.pct).toFixed(0)}% penjualan datang organik  -  basis sehat.`}
+              ))}
             </div>
           </div>
-        </>
-      )}
-
-      {/* 4. CONTRIBUTION MARGIN */}
-      <SectionLabel>CONTRIBUTION MARGIN</SectionLabel>
-      <div style={S.cmRow}>
-        {(() => {
-          // Try marginFor first, fallback to cogsItems direct lookup
-          const cogsMap2 = {};
-          (cogsItems || []).forEach(item => {
-            if (item.harga && item.total) {
-              const pct = (item.harga - item.total) / item.harga * 100;
-              cogsMap2[item.sku] = pct;
-              cogsMap2[item.nama] = pct;
-            }
-          });
-          const getMargin = (ad) => {
-            const m = marginFor(ad);
-            if (m != null) return m;
-            // fallback: match by ad name against cogsItems
-            if (!ad.name) return null;
-            const name = ad.name.toLowerCase();
-            for (const [k, v] of Object.entries(cogsMap2)) {
-              if (k && name.includes(k.toLowerCase().slice(0,10))) return v;
-            }
-            return null;
-          };
-          let grossProfit = 0, adSpendKnown = 0, knownGmv = 0, unknownGmv = 0;
-          active.ads.forEach(ad => {
-            const m = getMargin(ad);
-            if (m != null) {
-              grossProfit += ad.gmv * (m / 100);
-              adSpendKnown += ad.spend;
-              knownGmv += ad.gmv;
-            } else {
-              unknownGmv += ad.gmv;
-            }
-          });
-          const contribution = grossProfit - adSpendKnown;
-          const hasData = knownGmv > 0 || (cogsItems?.length > 0 && cm.knownGmv > 0);
-
-          if (!hasData) return (
-            <div style={S.cmEmpty}>
-              Set COGS / margin per produk di tab <b>COGS / Margin</b> untuk menghitung contribution margin.
-            </div>
-          );
-          return (
-            <>
-              <div style={S.cmCard}>
-                <div style={S.cmLabel}>Gross profit (GMV × margin)</div>
-                <div style={S.cmVal}>{rp(knownGmv > 0 ? grossProfit : cm.grossProfit)}</div>
-              </div>
-              <div style={S.cmCard}>
-                <div style={S.cmLabel}>− Ad spend</div>
-                <div style={S.cmVal}>{rp(knownGmv > 0 ? adSpendKnown : active.ads.reduce((t,ad) => t+(marginFor(ad)!=null?ad.spend:0),0))}</div>
-              </div>
-              <div style={{ ...S.cmCard, ...S.cmCardFinal }}>
-                <div style={S.cmLabel}>Contribution margin</div>
-                <div style={{ ...S.cmVal, color: (knownGmv > 0 ? contribution : cm.contribution) >= 0 ? C.good : C.bad }}>{rp(knownGmv > 0 ? contribution : cm.contribution)}</div>
-              </div>
-              {unknownGmv > 0 && <div style={S.cmNote}>⚠ {rpShort(unknownGmv)} GMV belum punya COGS — belum dihitung.</div>}
-            </>
-          );
-        })()}
-      </div>
-
-      {/* 5. STRATEGI HIGHLIGHT */}
-      {(() => {
-        const buckets = { scale: [], hold: [], fix: [] };
-        active.ads.forEach(ad => {
-          const m = marginFor(ad);
-          const dx = diagnose(ad, m, thresholds);
-          if (dx.some(d => d.tag === "SCALE")) buckets.scale.push(ad);
-          else if (dx.some(d => d.tag === "DI BAWAH TARGET" || d.tag === "MAKAN MARGIN")) buckets.hold.push(ad);
-          else if (dx.some(d => d.tag === "CTR RENDAH" || d.tag === "CVR RENDAH")) buckets.fix.push(ad);
-        });
-        const prods = activeProducts?.products || [];
-        const lowStock = prods.filter(p => p.stock != null && p.stock < 10);
-        const sh = shopeeSnap?.summary;
-        const refundAlert = sh?.refundRateValue > 3;
-        const feeAlert = sh?.feeRateNetGmv > 22;
-        const priorities = [];
-        if (buckets.scale.length > 0) priorities.push({ level: "good", text: `${buckets.scale.length} iklan siap scale — naikkan budget 20–30%`, tag: "SCALE" });
-        if (buckets.hold.length > 0) priorities.push({ level: "bad", text: `${buckets.hold.length} iklan di bawah target — ketatkan atau pause`, tag: "HOLD" });
-        if (lowStock.length > 0) priorities.push({ level: "watch", text: `${lowStock.length} produk stok kritis (<10 unit)`, tag: "RESTOCK" });
-        if (refundAlert) priorities.push({ level: "bad", text: `Retur ${sh.refundRateValue.toFixed(1)}% — di atas normal, perlu diaudit`, tag: "RETUR" });
-        if (feeAlert) priorities.push({ level: "watch", text: `Fee rate ${sh.feeRateNetGmv.toFixed(1)}% — cek komposisi voucher & promo`, tag: "FEE" });
-        if (buckets.fix.length > 0) priorities.push({ level: "watch", text: `${buckets.fix.length} iklan CTR/CVR rendah — perlu fix materi atau listing`, tag: "FIX" });
-        if (priorities.length === 0) return null;
-        return (
-          <>
-            <SectionLabel>HIGHLIGHT STRATEGI</SectionLabel>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
-              {priorities.slice(0, 4).map((p, i) => (
-                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch}`, borderRadius: "0 8px 8px 0", padding: "9px 14px" }}>
-                  <span style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch, background: (p.level === "good" ? C.good : p.level === "bad" ? C.bad : C.watch) + "18", padding: "2px 7px", borderRadius: 4, letterSpacing: 0.5, flexShrink: 0 }}>{p.tag}</span>
-                  <span style={{ fontFamily: sans, fontSize: 12.5, color: C.ink }}>{p.text}</span>
-                </div>
-              ))}
-              {priorities.length > 4 && <div style={{ fontFamily: sans, fontSize: 11, color: C.muted, paddingLeft: 4 }}>+{priorities.length - 4} item lain — lihat tab Strategi untuk detail lengkap.</div>}
-            </div>
-          </>
         );
       })()}
 
-      {/* 6. ACTION PLAN */}
-      <SectionLabel>ACTION PLAN</SectionLabel>
-      <ActionPlan active={active} marginFor={marginFor} agg={agg} thresholds={thresholds} cogsItems={cogsItems} />
+      {/* ── 8. TOP 10 PRODUK TERLARIS ── */}
+      {(activeProducts || tiktokOrdersSnap) && (() => {
+        // Combined product ranking
+        const map = {};
+        (activeProducts?.products || []).forEach(p => {
+          if (!map[p.name]) map[p.name] = { name:p.name, shopeeQty:0, tiktokQty:0, totalQty:0, totalGmv:0 };
+          map[p.name].shopeeQty += p.qty||0;
+          map[p.name].totalGmv += p.sales||0;
+        });
+        (tiktokOrdersSnap?.skuPerf || []).forEach(p => {
+          if (!map[p.productName]) map[p.productName] = { name:p.productName, shopeeQty:0, tiktokQty:0, totalQty:0, totalGmv:0 };
+          map[p.productName].tiktokQty += p.qty||0;
+          map[p.productName].totalGmv += p.gmv||0;
+        });
+        const top10 = Object.values(map)
+          .map(p => ({ ...p, totalQty: p.shopeeQty + p.tiktokQty }))
+          .sort((a,b) => b.totalQty - a.totalQty).slice(0,10);
+        if (!top10.length) return null;
+        const maxQty = top10[0].totalQty || 1;
+        return (
+          <div style={{ marginTop:10 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+              <div style={{ fontFamily:mono, fontSize:10, color:C.dim, letterSpacing:1, textTransform:"uppercase" }}>Top 10 Produk Terlaris · {activeProducts&&tiktokOrdersSnap?"Shopee + TikTok":activeProducts?"Shopee":"TikTok"}</div>
+              {onGoToProduct && <button onClick={onGoToProduct} style={{ fontFamily:mono, fontSize:10, color:C.accent, background:"none", border:"none", cursor:"pointer" }}>lihat semua →</button>}
+            </div>
+            <div style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:10, padding:"12px 14px" }}>
+              {top10.map((p,i) => (
+                <div key={i} style={{ marginBottom:i<9?10:0 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+                    <div style={{ display:"flex", gap:8, alignItems:"center", flex:1, minWidth:0 }}>
+                      <span style={{ fontFamily:mono, fontSize:10, color:C.dim, minWidth:16 }}>#{i+1}</span>
+                      <span style={{ fontFamily:sans, fontSize:12, fontWeight:i<3?700:400, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{p.name}</span>
+                    </div>
+                    <div style={{ display:"flex", gap:8, flexShrink:0, marginLeft:8 }}>
+                      {p.tiktokQty>0 && <span style={{ fontFamily:mono, fontSize:10, color:"#fe2c55" }}>{p.tiktokQty}</span>}
+                      {p.shopeeQty>0 && <span style={{ fontFamily:mono, fontSize:10, color:"#F97316" }}>{p.shopeeQty}</span>}
+                      <span style={{ fontFamily:mono, fontSize:11, fontWeight:700, color:C.ink }}>{p.totalQty} pcs</span>
+                    </div>
+                  </div>
+                  <div style={{ height:3, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
+                    <div style={{ width:(p.totalQty/maxQty*100)+"%", height:"100%", background:i===0?C.accent:i<3?C.good:C.muted, borderRadius:2 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
 
-function deltaStr(d) {
-  if (d == null) return null;
-  const s = (d >= 0 ? "▲ " : "▼ ") + Math.abs(d).toFixed(0) + "%";
-  return { text: s, up: d >= 0 };
-}
-
-/* aggregated action plan: pulls worst offenders + scale candidates */
-function ActionPlan({ active, marginFor, thresholds, cogsItems }) {
-  const items = useMemo(() => {
-    const scale = [], cut = [], fix = [];
-    active.ads.forEach((ad) => {
-      const m = marginFor(ad);
-      const dx = diagnose(ad, m, thresholds);
-      dx.forEach((d) => {
-        if (d.tag === "SCALE") scale.push({ ad, d });
-        else if (d.tag === "DI BAWAH TARGET" || d.tag === "MAKAN MARGIN") cut.push({ ad, d });
-        else if (d.level === "watch" && (d.tag.includes("CTR") || d.tag.includes("CVR"))) fix.push({ ad, d });
-      });
-    });
-    return { scale, cut, fix };
-  }, [active, marginFor, thresholds]);
-
-  const noMargin = active.ads.every((ad) => marginFor(ad) == null) && !(cogsItems?.length > 0);
-  if (noMargin) return <div style={S.cmEmpty}>Action plan butuh margin. Isi COGS dulu untuk rekomendasi scale/hold yang akurat.</div>;
-
-  return (
-    <div style={S.planGrid}>
-      <PlanCol title="SCALE" color={C.good} items={items.scale} />
-      <PlanCol title="HOLD / CUT" color={C.bad} items={items.cut} />
-      <PlanCol title="FIX MATERI" color={C.watch} items={items.fix} />
-    </div>
-  );
-}
 function PlanCol({ title, color, items }) {
   return (
     <div style={S.planCol}>
@@ -3006,7 +3306,7 @@ function PlanCol({ title, color, items }) {
 }
 
 /* ---------- Performance --------------------------------------------------- */
-function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, tiktokAdsSnap, tiktokCampaignSnap, onImportTiktokCampaign }) {
+function Performance({ active, snapshots, marginFor, thresholds, saveThresholds, metaSnap, tiktokAdsSnap, tiktokCampaignSnap, onImportTiktokCampaign }) {
   const [channel, setChannel] = useState("shopee");
   const [sort, setSort] = useState("spend");
   const [dir, setDir] = useState(-1);
@@ -3061,9 +3361,119 @@ function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, 
 
       {channel === "meta" && metaSnap && <MetaAdsView snap={metaSnap} />}
       {channel === "tiktokads" && tiktokAdsSnap && <TikTokAdsView snap={tiktokAdsSnap} campaignSnap={tiktokCampaignSnap} onImportCampaign={onImportTiktokCampaign} />}
-      {channel === "all" && <AllChannelView active={active} metaSnap={metaSnap} tiktokAdsSnap={tiktokAdsSnap} />}
+      {channel === "all" && <AllChannelView active={active} metaSnap={metaSnap} tiktokAdsSnap={tiktokAdsSnap} thresholds={thresholds} />}
       {channel === "shopee" && <>
       <ThresholdPanel thresholds={thresholds} saveThresholds={saveThresholds} />
+
+      {/* Shopee Ads snapshot summary */}
+      {active && (() => {
+        const agg = aggregate(active.ads);
+        const days = (() => {
+          try {
+            const s = new Date(active.periodStart), e = new Date(active.periodEnd);
+            const d = Math.round((e - s) / 86400000) + 1;
+            return d > 0 ? d : null;
+          } catch { return null; }
+        })();
+        const metrics = [
+          { label: "TOTAL SPEND",    value: rpShort(agg.spend),             color: C.watch },
+          { label: "TOTAL GMV",      value: rpShort(agg.gmv),               color: C.accent },
+          { label: "BLENDED ROAS",   value: agg.roas.toFixed(2) + "x",      color: agg.roas >= (thresholds.targetRoas||5) ? C.good : C.bad },
+          { label: "TOTAL KONVERSI", value: nfmt(agg.conv),                  color: C.ink },
+          { label: "AVG CPA",        value: rpShort(agg.cpa),               color: C.muted },
+          ...(days ? [{ label: "AVG DAILY SPEND", value: rpShort(agg.spend / days), color: C.muted }] : []),
+        ];
+        return (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 18px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, marginBottom: 12 }}>
+              SHOPEE ADS · {active.periodStart} → {active.periodEnd}{days ? ` · ${days} HARI` : ""}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 10 }}>
+              {metrics.map((m, i) => (
+                <div key={i}>
+                  <div style={{ fontFamily: mono, fontSize: 9, color: C.dim, letterSpacing: 0.8, marginBottom: 3 }}>{m.label}</div>
+                  <div style={{ fontFamily: mono, fontSize: 16, fontWeight: 700, color: m.color }}>{m.value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Trend chart multi-snapshot */}
+      {snapshots && snapshots.length > 1 && (() => {
+        const sorted = [...snapshots].sort((a,b) => a.endTs - b.endTs).slice(-8);
+        const roasData = sorted.map(s => ({ lbl: s.periodEnd?.slice(5) || "", val: aggregate(s.ads).roas }));
+        const spendData = sorted.map(s => ({ lbl: s.periodEnd?.slice(5) || "", val: aggregate(s.ads).spend }));
+        const maxRoas = Math.max(...roasData.map(d => d.val), 1);
+        const maxSpend = Math.max(...spendData.map(d => d.val), 1);
+        const W = 500, H = 80, padL = 8, padR = 8, padT = 8, padB = 24;
+        const xPos = (i) => padL + (i / Math.max(sorted.length - 1, 1)) * (W - padL - padR);
+        const yRoas = (v) => padT + (1 - v / (maxRoas * 1.1)) * (H - padT - padB);
+        const ySpend = (v) => padT + (1 - v / (maxSpend * 1.1)) * (H - padT - padB);
+        const roasPts = roasData.map((d,i) => `${xPos(i)},${yRoas(d.val)}`).join(" ");
+        const spendPts = spendData.map((d,i) => `${xPos(i)},${ySpend(d.val)}`).join(" ");
+        const targetY = yRoas(thresholds.targetRoas || 5);
+        return (
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 16px", marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1 }}>TREN HISTORIS · {sorted.length} SNAPSHOT</div>
+              <div style={{ display: "flex", gap: 14 }}>
+                {[[C.accent, "ROAS"], [C.watch, "Spend"]].map(([c, l]) => (
+                  <div key={l} style={{ display: "flex", alignItems: "center", gap: 4, fontFamily: mono, fontSize: 10, color: C.muted }}>
+                    <div style={{ width: 16, height: 2, background: c, borderRadius: 1 }} />{l}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H, overflow: "visible" }}>
+              {/* Target ROAS line */}
+              {thresholds.targetRoas <= maxRoas * 1.1 && (
+                <line x1={padL} x2={W-padR} y1={targetY} y2={targetY} stroke={C.accent} strokeWidth="0.6" strokeDasharray="4,3" opacity="0.5" />
+              )}
+              {/* Spend line */}
+              <polyline points={spendPts} fill="none" stroke={C.watch} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" opacity="0.7" />
+              {/* ROAS line */}
+              <polyline points={roasPts} fill="none" stroke={C.accent} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+              {/* Dots ROAS */}
+              {roasData.map((d,i) => (
+                <g key={i}>
+                  <circle cx={xPos(i)} cy={yRoas(d.val)} r="3" fill={d.val >= (thresholds.targetRoas||5) ? C.good : C.bad} stroke={C.panel} strokeWidth="1.5" />
+                  <title>{`${d.lbl}: ROAS ${d.val.toFixed(2)}x`}</title>
+                </g>
+              ))}
+              {/* X labels */}
+              {roasData.map((d,i) => (
+                <text key={i} x={xPos(i)} y={H - 2} textAnchor="middle" fontSize="8" fill={C.dim} fontFamily="monospace">{d.lbl}</text>
+              ))}
+              {/* Latest ROAS value label */}
+              {roasData.length > 0 && (
+                <text x={xPos(roasData.length-1) + 6} y={yRoas(roasData[roasData.length-1].val) + 3} fontSize="9" fill={C.accent} fontFamily="monospace" fontWeight="700">
+                  {roasData[roasData.length-1].val.toFixed(1)}x
+                </text>
+              )}
+            </svg>
+            {/* Trend summary */}
+            {roasData.length >= 2 && (() => {
+              const first = roasData[0].val, last = roasData[roasData.length-1].val;
+              const trend = last - first;
+              const spendFirst = spendData[0].val, spendLast = spendData[spendData.length-1].val;
+              const spendTrend = spendLast - spendFirst;
+              return (
+                <div style={{ display: "flex", gap: 16, marginTop: 8, fontFamily: mono, fontSize: 11 }}>
+                  <span style={{ color: trend >= 0 ? C.good : C.bad }}>
+                    ROAS {trend >= 0 ? "▲" : "▼"} {Math.abs(trend).toFixed(2)}x ({first.toFixed(2)}x → {last.toFixed(2)}x)
+                  </span>
+                  <span style={{ color: C.muted }}>·</span>
+                  <span style={{ color: spendTrend >= 0 ? C.watch : C.good }}>
+                    Spend {spendTrend >= 0 ? "▲" : "▼"} {rpShort(Math.abs(spendTrend))}
+                  </span>
+                </div>
+              );
+            })()}
+          </div>
+        );
+      })()}
 
       {/* Scatter ROAS vs Spend + Ranking panel */}
       {active.ads.length > 0 && (() => {
@@ -3176,6 +3586,54 @@ function Performance({ active, marginFor, thresholds, saveThresholds, metaSnap, 
           </div>
         );
       })()}
+      {/* Action priority summary */}
+      {active.ads.length > 0 && (() => {
+        const targetRoas = thresholds.targetRoas || 5;
+        const scaleAds  = active.ads.filter(a => a.roas >= targetRoas * 1.5 && a.spend > 0);
+        const pauseAds  = active.ads.filter(a => a.roas < targetRoas * 0.5 && a.spend > 0);
+        const watchAds  = active.ads.filter(a => a.roas >= targetRoas * 0.5 && a.roas < targetRoas && a.spend > 0);
+        const fixCtr    = active.ads.filter(a => a.ctr < thresholds.minCtr && (a.impr||0) >= thresholds.minImprForCtr);
+        const fixCvr    = active.ads.filter(a => a.cvr < thresholds.minCvr && (a.clicks||0) >= thresholds.minClicksForCvr);
+        if (!scaleAds.length && !pauseAds.length && !watchAds.length) return null;
+        return (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 12 }}>
+            {scaleAds.length > 0 && (
+              <div style={{ background: C.good + "12", border: `1px solid ${C.good}44`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.good, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🚀 SCALE ({scaleAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.good }}>ROAS ≥{(targetRoas*1.5).toFixed(1)}x — naikkan budget bertahap</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.good, marginTop: 4 }}>{rpShort(scaleAds.reduce((t,a)=>t+a.spend,0))} spend</div>
+              </div>
+            )}
+            {pauseAds.length > 0 && (
+              <div style={{ background: C.bad + "10", border: `1px solid ${C.bad}44`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.bad, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>⛔ PAUSE ({pauseAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.bad }}>ROAS &lt;{(targetRoas*0.5).toFixed(1)}x — hentikan, review ulang</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.bad, marginTop: 4 }}>{rpShort(pauseAds.reduce((t,a)=>t+a.spend,0))} spend sia-sia</div>
+              </div>
+            )}
+            {watchAds.length > 0 && (
+              <div style={{ background: C.watch + "12", border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>👀 PANTAU ({watchAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>ROAS di bawah target — jangan scale dulu</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.watch, marginTop: 4 }}>{rpShort(watchAds.reduce((t,a)=>t+a.spend,0))} spend</div>
+              </div>
+            )}
+            {fixCtr.length > 0 && (
+              <div style={{ background: C.watch + "10", border: `1px solid ${C.watch}33`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🎨 FIX CREATIVE ({fixCtr.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>CTR rendah — ganti visual/hook iklan</div>
+              </div>
+            )}
+            {fixCvr.length > 0 && (
+              <div style={{ background: C.watch + "10", border: `1px solid ${C.watch}33`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🛒 FIX HALAMAN ({fixCvr.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>CVR rendah — cek harga, foto, review produk</div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       <div style={S.perfBar}>
         <SectionLabel inline>PER IKLAN · {active.ads.length}</SectionLabel>
         <input placeholder="cari iklan..." value={q} onChange={(e) => setQ(e.target.value)} style={S.search} />
@@ -3748,87 +4206,328 @@ function CogsTab({ active, cogsMap, setCogsMap, keyFor, flash, cogsItems, onImpo
 }
 
 /* ---------- Product tab (BCG share × CVR) -------------------------------- */
-function ProductTab({ snap, thresholds, active, feeRate }) {
+function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, feeRate, onImportTiktok }) {
+  const [ptab, setPtab] = useState("top15");
+  const [channel, setChannel] = useState("shopee");
+  const [openCode, setOpenCode] = useState(null);
+
+  const hasShopee = !!(snap?.products?.length || orderSnap?.orders?.length);
+  const hasTiktok = !!(tiktokOrdersSnap?.skuPerf?.length);
+
   const adMap = useMemo(() => {
     const m = {};
     if (active) active.ads.forEach(ad => { if (ad.code && ad.code !== "-") m[ad.code] = ad; });
     return m;
   }, [active]);
-  const classified = useMemo(() => classifyBCG(snap.products, adMap, feeRate || 0), [snap, adMap, feeRate]);
-  const [openCode, setOpenCode] = useState(null);
 
-  const adByCode = adMap; // reuse from classifyBCG
-
+  const classified = useMemo(() => snap ? classifyBCG(snap.products, adMap, feeRate || 0) : [], [snap, adMap, feeRate]);
   const counts = classified.reduce((a, p) => (a[p.quadrant]++, a), { star: 0, cashcow: 0, question: 0, dog: 0 });
+
+  // Shopee top 15 dari orderSnap (lebih akurat dari file performa produk)
+  const shopeeTop15 = useMemo(() => {
+    // Prioritize orderSnap if available
+    if (orderSnap?.orders?.length) {
+      const map = {};
+      orderSnap.orders.forEach(o => {
+        const selesai = (o.status || "").toLowerCase().includes("selesai") || !o.status;
+        if (!selesai) return;
+        const name = o.produk || o.name || o.sku || "Unknown";
+        if (!map[name]) map[name] = { name, qty: 0, gmv: 0 };
+        map[name].qty += o.qty || o.jumlah || 1;
+        map[name].gmv += o.subtotal || 0;
+      });
+      return Object.values(map).sort((a,b) => b.qty - a.qty).slice(0, 15);
+    }
+    // Fallback to performa produk file
+    if (snap?.products?.length) {
+      return [...snap.products].sort((a,b) => b.sales - a.sales).slice(0, 15)
+        .map(p => ({ name: p.name, qty: p.qty || 0, gmv: p.sales || 0 }));
+    }
+    return [];
+  }, [orderSnap, snap]);
+
+  const tiktokTop15 = useMemo(() => (tiktokOrdersSnap?.skuPerf || []).slice(0, 15), [tiktokOrdersSnap]);
+
+  const combinedTop15 = useMemo(() => {
+    const map = {};
+    shopeeTop15.forEach(p => {
+      map[p.name] = { name: p.name, shopeeQty: p.qty, shopeeGmv: p.gmv, tiktokQty: 0, tiktokGmv: 0 };
+    });
+    (tiktokOrdersSnap?.skuPerf || []).forEach(p => {
+      const key = p.productName;
+      if (!map[key]) map[key] = { name: key, shopeeQty: 0, shopeeGmv: 0, tiktokQty: 0, tiktokGmv: 0 };
+      map[key].tiktokQty += p.qty;
+      map[key].tiktokGmv += p.gmv;
+    });
+    return Object.values(map)
+      .map(p => ({ ...p, totalQty: p.shopeeQty + p.tiktokQty, totalGmv: p.shopeeGmv + p.tiktokGmv }))
+      .sort((a, b) => b.totalQty - a.totalQty).slice(0, 15);
+  }, [shopeeTop15, tiktokOrdersSnap]);
+
+  const bcgByPesanan = useMemo(() => {
+    if (!snap?.products?.length) return [];
+    const tiktokMap = {};
+    (tiktokOrdersSnap?.skuPerf || []).forEach(p => { tiktokMap[p.productName] = p; });
+    const totalOrders = tiktokOrdersSnap?.summary?.selesaiOrders || 1;
+    const totalSales = snap.products.reduce((t, p) => t + (p.sales || 0), 1);
+    return snap.products.map(p => {
+      const tt = tiktokMap[p.name] || null;
+      const combinedGmv = (p.sales || 0) + (tt?.gmv || 0);
+      const orderShare = tt ? (tt.orders / totalOrders * 100) : 0;
+      const revenueShare = combinedGmv / totalSales * 100;
+      const isHighRevShare = revenueShare > 10;
+      const isHighOrderShare = orderShare > 5 || (p.qty || 0) > 30;
+      const quadrant = isHighRevShare && isHighOrderShare ? "star"
+        : isHighRevShare ? "cashcow"
+        : isHighOrderShare ? "question" : "dog";
+      return { ...p, tt, combinedGmv, orderShare, revenueShare, quadrant };
+    }).sort((a, b) => b.combinedGmv - a.combinedGmv);
+  }, [snap, tiktokOrdersSnap]);
+
+  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","hitam","putih","abu","biru","merah","hijau","coklat","krem","sand","stone","sage","rust","teal","mint","burgundy","caramel","charcoal"];
+  const topColors = useMemo(() => {
+    const map = {};
+    (snap?.products || []).forEach(p => {
+      const text = (p.name || "").toLowerCase();
+      colorWords.forEach(c => { if (text.includes(c)) map[c] = (map[c] || 0) + (p.qty || 0); });
+    });
+    (tiktokOrdersSnap?.topColors || []).forEach(({ color, count }) => {
+      map[color] = (map[color] || 0) + count;
+    });
+    return Object.entries(map).filter(([,v]) => v > 0).sort((a,b) => b[1]-a[1]).slice(0, 10)
+      .map(([color, count]) => ({ color, count }));
+  }, [snap, tiktokOrdersSnap]);
+
+  const colorSwatch = { black:"#1a1a1a",white:"#f0f0f0",navy:"#003580",beige:"#e8d5b0",grey:"#9e9e9e",gray:"#9e9e9e",green:"#388e3c",blue:"#1565c0",red:"#c62828",brown:"#6d4c41",cream:"#fff8e1",khaki:"#c8b560",olive:"#808000",maroon:"#880000",yellow:"#f9a825",pink:"#e91e8c",purple:"#7b1fa2",orange:"#e65100",hitam:"#1a1a1a",putih:"#f0f0f0",abu:"#9e9e9e",biru:"#1565c0",merah:"#c62828",hijau:"#388e3c",coklat:"#6d4c41",krem:"#fff8e1",sand:"#c2b280",stone:"#928e85",sage:"#b2c9ad",rust:"#b7410e",teal:"#008080",mint:"#98ff98",burgundy:"#800020",caramel:"#c68642",charcoal:"#36454f" };
+
+  // Sub-tabs available per channel
+  const subTabs = [
+    { k:"top15", lbl:"Top 15" },
+    ...((channel==="shopee"||channel==="all") && snap?.products?.length ? [{ k:"bcg_revenue", lbl:"BCG Revenue" }] : []),
+    ...(hasTiktok && snap?.products?.length ? [{ k:"bcg_pesanan", lbl:"BCG Pesanan" }] : []),
+    { k:"warna", lbl:"Warna" },
+  ];
 
   return (
     <div>
-      <SectionLabel>BCG MATRIX · {snap.products.length} SKU · {snap.periodStart} → {snap.periodEnd}</SectionLabel>
-      <div style={S.bcgIntro}>
-        Sumbu X = net revenue share{feeRate > 0 ? ` (fee-adjusted ${feeRate.toFixed(0)}%)` : " (gross)"}, sumbu Y = blended CVR{active ? " (produk + iklan)" : " (produk)"}.
-        {" "}Star = scale; Cash Cow = fix konversi; Question Mark = kandidat iklan; Dog = evaluasi.
-        {feeRate > 0 && <span style={{ color: C.good, marginLeft: 8 }}>✓ income file terhubung</span>}
-        {active && <span style={{ color: C.good, marginLeft: 8 }}>✓ data iklan terhubung</span>}
-      </div>
-      <BCGScatter classified={classified} onPick={(c) => setOpenCode(c === openCode ? null : c)} openCode={openCode} />
-      <div style={S.quadLegend}>
-        {Object.entries(QUAD).map(([k, q]) => (
-          <div key={k} style={S.quadLegendItem}>
-            <span style={{ ...S.quadDot, background: q.color }} />
-            <b style={{ color: q.color }}>{q.label}</b>
-            <span style={S.muted}>{counts[k]} · {q.desc}</span>
-          </div>
-        ))}
-      </div>
-      <SectionLabel>DIAGNOSA &amp; SARAN  -  PER SKU</SectionLabel>
-      <div>
-        {classified.map((p) => {
-          const q = QUAD[p.quadrant];
-          const dx = diagnoseProduct(p, thresholds);
-          const isOpen = openCode === p.code;
-          const ad = adByCode[p.code];
-          const borderCol = q.color;
+      {/* ── CHANNEL TABS — level 1 ── */}
+      <div style={{ display:"flex", gap:0, marginBottom:0, borderBottom:`2px solid ${C.line}` }}>
+        {[["shopee","🟠 Shopee"],["tiktok","⚫ TikTok Shop"],["all","Semua Channel"]].map(([k,lbl]) => {
+          const disabled = (k==="shopee"&&!hasShopee)||(k==="tiktok"&&!hasTiktok)||(k==="all"&&!hasShopee&&!hasTiktok);
+          const active = channel === k;
+          const colors = { shopee:"#F97316", tiktok:"#fe2c55", all:C.accent };
           return (
-            <div key={p.code} id={"sku-" + p.code} style={{ ...S.skuCard, borderLeftColor: borderCol }}>
-              <div style={S.skuHead} onClick={() => setOpenCode(isOpen ? null : p.code)}>
-                <div style={S.skuHeadL}>
-                  <QuadTag q={p.quadrant} />
-                  <span style={S.skuName}>{p.name}</span>
-                </div>
-                <div style={S.skuHeadR}>
-                  <span style={S.skuStat}>share <b>{p.share.toFixed(1)}%</b></span>
-                  <span style={S.skuStat}>CVR <b>{p.blendedCvr ? p.blendedCvr.toFixed(2) : p.cvr.toFixed(2)}%</b></span>
-                  <span style={S.skuStat}>{rpShort(p.sales)}</span>
-                  {p.roas != null && <span style={{ ...S.skuStat, color: p.roas >= 5 ? C.good : p.roas >= 3 ? C.watch : C.bad }}>ROAS {p.roas.toFixed(1)}</span>}
-                  {p.adGmv > 0 && <span style={{ ...S.skuStat, color: C.muted }}>iklan {rpShort(p.adGmv)}</span>}
-                  <span style={{ color: C.muted, fontFamily: mono }}>{isOpen ? "▾" : "▸"}</span>
-                </div>
-              </div>
-              {isOpen && (
-                <div style={S.skuBody}>
-
-                  {dx.map((d, i) => (
-                    <div key={i} style={{ ...S.skuDiag, borderLeftColor: d.level === "bad" ? C.bad : d.level === "good" ? C.good : C.watch }}>
-                      <div style={{ ...S.skuDiagTitle, color: d.level === "bad" ? C.bad : d.level === "good" ? C.good : C.watch }}>{d.title}</div>
-                      <div style={S.skuDiagMsg}>{d.msg}</div>
-                    </div>
-                  ))}
-                  {ad && <CrossSignal p={p} ad={ad} thresholds={thresholds} />}
-                  {!ad && p.quadrant === "question" && (
-                    <div style={{ ...S.skuDiag, borderLeftColor: C.accent }}>
-                      <div style={{ ...S.skuDiagTitle, color: C.accent }}>Silang iklan × produk</div>
-                      <div style={S.skuDiagMsg}>CVR terbukti bagus tapi belum ada iklan produk sendiri. Kandidat kuat untuk dibuatkan iklan.</div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <button key={k} disabled={disabled} onClick={()=>{ setChannel(k); setPtab("top15"); }}
+              style={{ fontFamily:sans, fontSize:12, fontWeight:700, padding:"10px 18px",
+                cursor:disabled?"not-allowed":"pointer", border:"none", borderBottom:`2px solid ${active?colors[k]:"transparent"}`,
+                background:"transparent", color:disabled?C.dim:active?colors[k]:C.muted,
+                opacity:disabled?0.35:1, marginBottom:-2, transition:"color 0.15s" }}>
+              {lbl}
+            </button>
           );
         })}
+        {!hasTiktok && (
+          <button onClick={onImportTiktok}
+            style={{ fontFamily:sans, fontSize:11, padding:"10px 14px", border:"none", background:"transparent", color:"#fe2c55", cursor:"pointer", marginLeft:"auto" }}>
+            + Import TikTok →
+          </button>
+        )}
       </div>
+
+      {/* ── SUB TABS — level 2 ── */}
+      <div style={{ display:"flex", gap:4, padding:"10px 0 14px", flexWrap:"wrap" }}>
+        {subTabs.map(({ k, lbl }) => (
+          <button key={k} onClick={()=>setPtab(k)} style={{
+            fontFamily:mono, fontSize:10, fontWeight:700, padding:"5px 12px", borderRadius:20,
+            cursor:"pointer", border:`1px solid ${ptab===k?C.accent:C.line}`,
+            background:ptab===k?C.accent:C.panel2,
+            color:ptab===k?"#fff":C.muted, letterSpacing:0.3,
+          }}>{lbl}</button>
+        ))}
+      </div>
+
+      {/* ── TOP 15 ── */}
+      {ptab === "top15" && (
+        <>
+          <SectionLabel>TOP 15 PRODUK · {channel==="shopee"?"Shopee":channel==="tiktok"?"TikTok Shop":"Semua Channel"}</SectionLabel>
+          {(channel==="shopee"||channel==="all") && hasShopee && channel!=="tiktok" && (
+            <>
+              {(channel==="all" ? combinedTop15 : shopeeTop15.map(p=>({...p,shopeeQty:p.qty,shopeeGmv:p.gmv,tiktokQty:0,tiktokGmv:0,totalQty:p.qty,totalGmv:p.gmv}))).map((p,i) => {
+                const list = channel==="all" ? combinedTop15 : shopeeTop15;
+                const maxVal = list[0]?.totalQty || list[0]?.qty || 1;
+                const qty = channel==="all" ? p.totalQty : p.qty || p.shopeeQty;
+                const gmv = channel==="all" ? p.totalGmv : p.gmv || p.shopeeGmv;
+                return (
+                  <div key={i} style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 14px", marginBottom:6 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:5 }}>
+                      <div style={{ display:"flex", gap:8, alignItems:"center", flex:1, minWidth:0 }}>
+                        <span style={{ fontFamily:mono, fontSize:11, color:C.dim, minWidth:22, flexShrink:0 }}>#{i+1}</span>
+                        <span style={{ fontFamily:sans, fontSize:13, fontWeight:i<3?700:500, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{p.name}</span>
+                      </div>
+                      <div style={{ display:"flex", gap:10, alignItems:"center", flexShrink:0, marginLeft:8 }}>
+                        {channel==="all" && p.tiktokQty > 0 && <span style={{ fontFamily:mono, fontSize:10, color:"#fe2c55" }}>TT {p.tiktokQty}</span>}
+                        {channel==="all" && p.shopeeQty > 0 && <span style={{ fontFamily:mono, fontSize:10, color:"#F97316" }}>SH {p.shopeeQty}</span>}
+                        <span style={{ fontFamily:mono, fontSize:12, fontWeight:700, color:C.ink }}>{qty} pcs</span>
+                        {gmv > 0 && <span style={{ fontFamily:mono, fontSize:11, color:C.muted }}>{rpShort(gmv)}</span>}
+                      </div>
+                    </div>
+                    <div style={{ height:3, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
+                      <div style={{ width:(qty/maxVal*100)+"%", height:"100%", background:i===0?C.accent:i<3?C.good:C.line, borderRadius:2 }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </>
+          )}
+          {channel==="tiktok" && hasTiktok && (
+            <>
+              {tiktokTop15.map((p,i) => (
+                <div key={i} style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 14px", marginBottom:8 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <div style={{ display:"flex", gap:8 }}>
+                      <span style={{ fontFamily:mono, fontSize:12, color:C.dim, minWidth:20 }}>#{i+1}</span>
+                      <div>
+                        <div style={{ fontFamily:sans, fontSize:13, fontWeight:700 }}>{p.productName}</div>
+                        <div style={{ fontFamily:mono, fontSize:10, color:C.dim }}>{p.sku}</div>
+                      </div>
+                    </div>
+                    <div style={{ display:"flex", gap:12 }}>
+                      <span style={{ fontFamily:mono, fontSize:12, fontWeight:700 }}>{p.qty} pcs</span>
+                      <span style={{ fontFamily:mono, fontSize:12, color:"#fe2c55" }}>{rpShort(p.gmv)}</span>
+                    </div>
+                  </div>
+                  <div style={{ height:4, background:C.panel2, borderRadius:2, overflow:"hidden" }}>
+                    <div style={{ width:(p.qty/(tiktokTop15[0]?.qty||1)*100)+"%", height:"100%", background:i===0?"#fe2c55":i<3?C.good:C.muted, borderRadius:2 }} />
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      {/* ── BCG by Revenue (Shopee) ── */}
+      {ptab === "bcg_revenue" && hasShopee && (
+        <>
+          <SectionLabel>BCG MATRIX · by Revenue Share · {snap.products.length} SKU · {snap.periodStart} → {snap.periodEnd}</SectionLabel>
+          <div style={S.bcgIntro}>
+            Sumbu X = net revenue share, sumbu Y = blended CVR. Star = scale; Cash Cow = fix konversi; Question Mark = kandidat iklan; Dog = evaluasi.
+            {feeRate > 0 && <span style={{ color:C.good, marginLeft:8 }}>✓ income terhubung</span>}
+          </div>
+          <BCGScatter classified={classified} onPick={(c) => setOpenCode(c===openCode?null:c)} openCode={openCode} />
+          <div style={S.quadLegend}>
+            {Object.entries(QUAD).map(([k, q]) => (
+              <div key={k} style={S.quadLegendItem}>
+                <span style={{ ...S.quadDot, background:q.color }} />
+                <b style={{ color:q.color }}>{q.label}</b>
+                <span style={S.muted}>{counts[k]} · {q.desc}</span>
+              </div>
+            ))}
+          </div>
+          <SectionLabel>DIAGNOSA & SARAN PER SKU</SectionLabel>
+          {classified.map((p) => {
+            const q = QUAD[p.quadrant];
+            const dx = diagnoseProduct(p, thresholds);
+            const isOpen = openCode === p.code;
+            const ad = adMap[p.code];
+            return (
+              <div key={p.code} id={"sku-"+p.code} style={{ ...S.skuCard, borderLeftColor:q.color }}>
+                <div style={S.skuHead} onClick={() => setOpenCode(isOpen?null:p.code)}>
+                  <div style={S.skuHeadL}><QuadTag q={p.quadrant} /><span style={S.skuName}>{p.name}</span></div>
+                  <div style={S.skuHeadR}>
+                    <span style={S.skuStat}>share <b>{p.share.toFixed(1)}%</b></span>
+                    <span style={S.skuStat}>CVR <b>{(p.blendedCvr||p.cvr||0).toFixed(2)}%</b></span>
+                    <span style={S.skuStat}>{rpShort(p.sales)}</span>
+                    {p.roas!=null && <span style={{ ...S.skuStat, color:p.roas>=5?C.good:p.roas>=3?C.watch:C.bad }}>ROAS {p.roas.toFixed(1)}</span>}
+                    <span style={{ color:C.muted, fontFamily:mono }}>{isOpen?"▾":"▸"}</span>
+                  </div>
+                </div>
+                {isOpen && (
+                  <div style={S.skuBody}>
+                    {dx.map((d,i) => (
+                      <div key={i} style={{ ...S.skuDiag, borderLeftColor:d.level==="bad"?C.bad:d.level==="good"?C.good:C.watch }}>
+                        <div style={{ ...S.skuDiagTitle, color:d.level==="bad"?C.bad:d.level==="good"?C.good:C.watch }}>{d.title}</div>
+                        <div style={S.skuDiagMsg}>{d.msg}</div>
+                      </div>
+                    ))}
+                    {ad && <CrossSignal p={p} ad={ad} thresholds={thresholds} />}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </>
+      )}
+
+      {/* ── BCG by Pesanan (TikTok demand signal) ── */}
+      {ptab === "bcg_pesanan" && (
+        <>
+          <SectionLabel>BCG MATRIX · by Rasio Pesanan TikTok + Revenue Shopee</SectionLabel>
+          <div style={S.bcgIntro}>
+            Sumbu X = revenue share gabungan, sumbu Y = demand signal dari pesanan TikTok. Produk yang laku di TikTok tapi GMV Shopee rendah = Question Mark berpotensi tinggi.
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))", gap:10, marginBottom:16 }}>
+            {[["star","⭐ Star","ROAS tinggi, demand tinggi",C.good],["cashcow","💰 Cash Cow","Revenue tinggi, demand TikTok rendah",C.accent],["question","❓ Question Mark","Demand TikTok tinggi, revenue belum besar","#F97316"],["dog","🐕 Dog","Rendah di keduanya",C.muted]].map(([k,lbl,desc,color]) => (
+              <div key={k} style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 12px" }}>
+                <div style={{ fontFamily:mono, fontSize:11, fontWeight:700, color, marginBottom:4 }}>{lbl}</div>
+                <div style={{ fontFamily:sans, fontSize:11, color:C.muted }}>{desc}</div>
+                <div style={{ fontFamily:mono, fontSize:13, fontWeight:700, color, marginTop:6 }}>{bcgByPesanan.filter(p=>p.quadrant===k).length} SKU</div>
+              </div>
+            ))}
+          </div>
+          {bcgByPesanan.map((p,i) => {
+            const colors = { star:C.good, cashcow:C.accent, question:"#F97316", dog:C.muted };
+            const col = colors[p.quadrant];
+            return (
+              <div key={i} style={{ background:C.panel, border:`1px solid ${C.line}`, borderLeft:`3px solid ${col}`, borderRadius:8, padding:"10px 14px", marginBottom:6 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <div>
+                    <span style={{ fontFamily:sans, fontSize:13, fontWeight:700 }}>{p.name}</span>
+                    <span style={{ fontFamily:mono, fontSize:10, color:col, marginLeft:8, fontWeight:700 }}>{p.quadrant.toUpperCase()}</span>
+                  </div>
+                  <div style={{ display:"flex", gap:12, fontFamily:mono, fontSize:11 }}>
+                    {p.tt && <span style={{ color:"#fe2c55" }}>TT {p.tt.qty}pcs</span>}
+                    <span style={{ color:"#F97316" }}>SH {rpShort(p.sales)}</span>
+                    <span style={{ color:C.muted }}>{p.revenueShare.toFixed(1)}% rev</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
+
+      {/* ── WARNA TERLARIS ── */}
+      {ptab === "warna" && (
+        <>
+          <SectionLabel>WARNA TERLARIS · {channel==="all"?"Semua Channel":channel==="shopee"?"Shopee":"TikTok Shop"}</SectionLabel>
+          {topColors.length === 0 && <div style={S.cmEmpty}>Tidak ada data warna — nama produk tidak mengandung kata warna yang dikenali.</div>}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))", gap:10 }}>
+            {topColors.map((c,i) => {
+              const sw = colorSwatch[c.color] || "#888";
+              const isLight = ["white","putih","cream","krem","beige","yellow","sand","mint"].includes(c.color);
+              return (
+                <div key={i} style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:10, overflow:"hidden" }}>
+                  <div style={{ height:40, background:sw, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                    <span style={{ fontFamily:mono, fontSize:11, fontWeight:700, color:isLight?"#333":"#fff", textTransform:"capitalize" }}>{c.color}</span>
+                  </div>
+                  <div style={{ padding:"10px 12px" }}>
+                    <div style={{ fontFamily:mono, fontSize:18, fontWeight:700, color:C.ink }}>{c.count} pcs</div>
+                    <div style={{ fontFamily:sans, fontSize:11, color:C.muted }}>#{i+1} terlaris</div>
+                    <div style={{ height:4, background:C.panel2, borderRadius:2, overflow:"hidden", marginTop:8 }}>
+                      <div style={{ width:(c.count/(topColors[0]?.count||1)*100)+"%", height:"100%", background:sw==="#f8f8f8"?"#ccc":sw, borderRadius:2 }} />
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
+
 
 
 // cross-cutting diagnosis combining the ad row and the product row for same code
@@ -4630,7 +5329,7 @@ function PanduanModal({ onClose, onGoToOverview }) {
       bg: C.good + "12",
       items: [
         { label: "Penghasilan Shopee", fmt: "XLSX", path: "Keuangan → Penghasilan Saya → Pilih Periode → Export Data → Download", note: "Dipakai untuk kalkulasi fee marketplace, waterfall revenue, dan analisa retur." },
-        { label: "Penghasilan TikTok", fmt: "XLSX", path: "TikTok Shop Seller Center → Keuangan → Penarikan Dana → Pilih Semua → Klik Unduh → Pilih Periode → Download", note: "Pastikan pilih 'Semua' sebelum klik Unduh." },
+        { label: "Penghasilan TikTok", fmt: "XLSX", path: "TikTok Seller Center → Keuangan → Transaksi → Tipe: Penghasilan → Unduh → Pilih Periode → Download", note: "Pilih tipe 'Penghasilan' sebelum klik Unduh. File berisi sheet Detail pesanan dan Laporan." },
       ]
     },
     {
@@ -4740,7 +5439,7 @@ function FeeEmpty({ onImportShopee, onImportTiktok }) {
         </div>
         <div style={S.emptyCard}>
           <div style={S.emptyCardTitle}>TikTok Shop</div>
-          <div style={S.emptyCardDesc}>Keuangan → Pendapatan → Download → "Detail pesanan" XLSX</div>
+          <div style={S.emptyCardDesc}>Keuangan → Transaksi → Tipe: Penghasilan → Unduh → Pilih Periode → Download</div>
         </div>
       </div>
       <p style={{ ...S.emptyText, marginTop: 16 }}>Import via tombol <b>+ Import Data ▼</b> di kanan atas.</p>
@@ -4766,7 +5465,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
       totalFee:        safeNum(sh?.totalFee)      + safeNum(tt?.totalFee),
       totalDilepas:    safeNum(sh?.totalDilepas)  + safeNum(tt?.totalDilepas),
       komisiAMS:       safeNum(sh?.komisiAMS)     + safeNum(tt?.komisiPlatform),
-      biayaAdmin:      safeNum(sh?.biayaAdmin)    + safeNum(tt?.komisiAfiliasi) + safeNum(tt?.komisiDinamis),
+      biayaAdmin:      safeNum(sh?.biayaAdmin)    + safeNum(tt?.komisiAfiliasi) + safeNum(tt?.komisiDinamis) + safeNum(tt?.biayaEksklusif),
       biayaLayanan:    safeNum(sh?.biayaLayanan),
       biayaProses:     safeNum(sh?.biayaProses)   + safeNum(tt?.biayaProses),
       adSpendTiktok:   safeNum(tt?.adSpend),
@@ -4776,12 +5475,12 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     c.takeRate      = c.netGmv ? (1 - c.totalDilepas / c.netGmv) * 100 : 0;
     c.shopeeShare   = c.netGmv && sh ? safeNum(sh.netGmv) / c.netGmv * 100 : 0;
     c.tiktokShare   = c.netGmv && tt ? safeNum(tt.netGmv) / c.netGmv * 100 : 0;
-    // Combined refund metrics
-    c.refundOrderCount = safeNum(sh?.refundOrderCount); // TikTok excluded — sample unreliable
+    // Combined refund metrics — now include TikTok
+    c.refundOrderCount = safeNum(sh?.refundOrderCount) + safeNum(tt?.refundOrderCount);
     c.refundValue      = safeNum(sh?.refundValue) + safeNum(tt?.refundValue);
-    c.totalOrderCount  = safeNum(sh?.totalOrderCount);  // TikTok excluded
+    c.totalOrderCount  = safeNum(sh?.totalOrderCount) + safeNum(tt?.totalOrderCount);
     c.refundRateOrder  = c.totalOrderCount ? (c.refundOrderCount / c.totalOrderCount) * 100 : 0;
-    c.refundRateValue  = c.netGmv ? (c.refundValue / c.netGmv) * 100 : 0; // basis Net GMV
+    c.refundRateValue  = c.netGmv ? (c.refundValue / c.netGmv) * 100 : 0;
     return c;
   }, [shopeeSnap, tiktokSnap]);
 
@@ -4824,6 +5523,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
   const waterfall = [
     { label: "GMV Bruto (Harga Asli)", value: ds?.hargaAsli || ds?.gmvBruto || 0, type: "gross" },
     { label: isTikTok ? "Diskon Penjual" : "Total Diskon Produk", value: ds?.diskonProduk || ds?.diskonPenjual || 0, type: "deduct" },
+    ...(isTikTok && ds?.refund ? [{ label: "Retur & Refund", value: ds.refund, type: "deduct" }] : []),
     ...(!isTikTok && ds?.refund ? [{ label: "Refund ke Pembeli", value: ds.refund, type: "deduct" }] : []),
     ...(!isTikTok && ds?.voucherSeller ? [{ label: "Voucher Penjual", value: ds.voucherSeller, type: "deduct" }] : []),
     { label: "NET GMV", value: ds?.netGmv || 0, type: "subtotal" },
@@ -4832,6 +5532,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     { label: isTikTok ? "Komisi Afiliasi" : "Biaya Administrasi (inkl. PPN 11%)", value: ds?.biayaAdmin || ds?.komisiAfiliasi || 0, type: "fee" },
     ...(!isTikTok ? [{ label: "Biaya Layanan", value: ds?.biayaLayanan || 0, type: "fee" }] : []),
     ...(isTikTok && ds?.komisiDinamis ? [{ label: "Komisi Dinamis", value: ds.komisiDinamis, type: "fee" }] : []),
+    ...(isTikTok && ds?.biayaEksklusif ? [{ label: "Biaya Akses Eksklusif", value: ds.biayaEksklusif, type: "fee" }] : []),
     { label: "Biaya Proses Pesanan", value: ds?.biayaProses || 0, type: "fee" },
     { label: "TOTAL FEE MARKETPLACE", value: ds?.totalFee || 0, type: "feetotal" },
     { label: "TOTAL DILEPAS KE SALDO", value: ds?.totalDilepas || 0, type: "result" },
@@ -4841,6 +5542,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     { label: "Biaya Komisi Platform", value: ds?.komisiPlatform || ds?.komisiAMS || 0 },
     { label: "Komisi Afiliasi", value: ds?.komisiAfiliasi || 0 },
     { label: "Komisi Dinamis", value: ds?.komisiDinamis || 0 },
+    { label: "Biaya Akses Eksklusif", value: ds?.biayaEksklusif || 0 },
     { label: "Biaya Proses Pesanan", value: ds?.biayaProses || 0 },
   ] : activeChannel === "shopee" ? [
     { label: "Biaya Layanan", value: ds?.biayaLayanan || 0 },
@@ -4854,6 +5556,7 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     { label: "TikTok: Komisi Platform", value: tiktokSnap?.summary?.komisiPlatform || 0 },
     { label: "TikTok: Komisi Afiliasi", value: tiktokSnap?.summary?.komisiAfiliasi || 0 },
     { label: "TikTok: Komisi Dinamis", value: tiktokSnap?.summary?.komisiDinamis || 0 },
+    { label: "TikTok: Biaya Akses Eksklusif", value: tiktokSnap?.summary?.biayaEksklusif || 0 },
   ].filter(f => f.value !== 0);
   const totalFeeAbs = Math.abs(ds?.totalFee || 0);
 
@@ -4913,7 +5616,12 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
         <FeeKpi label="Total Dilepas ke Saldo" value={rpShort(ds?.totalDilepas || 0)} color={C.good} sub={"masuk saldo penjual"} />
         <FeeKpi label="Fee Rate vs Harga Asli" value={(ds?.feeRateGross || 0).toFixed(1)+"%"} color={C.watch} />
         <FeeKpi label="Take Rate Total" value={(ds?.takeRate || 0).toFixed(1)+"%"} color={C.watch} sub={"% Net GMV yg tidak masuk saldo"} />
-        {/* Jumlah Pesanan card removed — TikTok file only captures released orders, misleading */}
+        {ds?.totalOrderCount > 0 && <FeeKpi
+          label="Total Pesanan"
+          value={nfmt(ds.totalOrderCount)}
+          color={C.ink}
+          sub={activeChannel === "combined" ? "Shopee + TikTok" : activeChannel === "tiktok" ? "TikTok Shop (settlement)" : "Shopee"}
+        />}
         {ds?.totalOrderCount > 0 && ds?.refundRateOrder != null && <FeeKpi
           label="Retur / Refund (order)"
           value={(ds.refundRateOrder || 0).toFixed(1) + "%"}
@@ -5148,58 +5856,72 @@ function AreaEmpty({ onImport }) {
   );
 }
 
-function AreaTab({ snap }) {
-  const [view, setView] = React.useState("provinsi"); // "provinsi" | "kota"
-  const [sortBy, setSortBy] = React.useState("pesanan"); // "pesanan" | "pcs"
+function AreaTab({ snap, tiktokOrdersSnap, onImportShopee, onImportTiktok }) {
+  const [view, setView] = React.useState("provinsi");
+  const [sortBy, setSortBy] = React.useState("pesanan");
+  const [channel, setChannel] = React.useState("all"); // "all" | "shopee" | "tiktok"
 
-  const { byProvinsi, byKota, highlights, returData } = useMemo(() => {
-    const orders = snap.orders || [];
-    const summary = snap.summary || {};
-    const total = orders.length;
-    const totalPcs = orders.reduce((t, o) => t + (o.qty || o.jumlah || 1), 0);
+  // Build combined area data
+  const { byProvinsi, byKota, highlights, returData, periodLabel, totalOrders } = useMemo(() => {
+    // Shopee orders
+    const shopeeOrders = (snap?.orders || []).map(o => ({
+      ...o, channel: "shopee",
+      provinsi: (o.provinsi || "").toUpperCase(),
+      kota: (o.kota || "").replace(/^(KOTA |KAB\. |KAB )/i, ""),
+      qty: o.qty || o.jumlah || 1,
+    }));
+    // TikTok orders (from parseTikTokOrdersCsv)
+    const tiktokOrders = (tiktokOrdersSnap?.orders || [])
+      .filter(o => o.status === "Selesai")
+      .map(o => ({
+        orderId: o.orderId, channel: "tiktok",
+        provinsi: (o.provinsi || "").toUpperCase(),
+        kota: (o.kota || "").replace(/^(KOTA |KAB\. |KAB )/i, ""),
+        qty: o.totalQty || 1,
+        subtotal: o.totalGmv || 0,
+      }));
 
-    // Group by provinsi
-    const provMap = {};
-    const kotaMap = {};
-    orders.forEach(o => {
+    const allOrders = channel === "shopee" ? shopeeOrders
+      : channel === "tiktok" ? tiktokOrders
+      : [...shopeeOrders, ...tiktokOrders];
+
+    const total = allOrders.length;
+    const totalPcs = allOrders.reduce((t, o) => t + o.qty, 0);
+
+    const provMap = {}, kotaMap = {};
+    allOrders.forEach(o => {
       const prov = o.provinsi || "Tidak diketahui";
       const kota = o.kota || "Tidak diketahui";
       if (!provMap[prov]) provMap[prov] = { pesanan: 0, pcs: 0, kota: {} };
       provMap[prov].pesanan++;
-      const pcs = o.qty || o.jumlah || 1;
-      provMap[prov].pcs += pcs;
-      provMap[prov].kota[kota] = (provMap[prov].kota[kota] || 0) + pcs;
+      provMap[prov].pcs += o.qty;
+      provMap[prov].kota[kota] = (provMap[prov].kota[kota] || 0) + o.qty;
       if (!kotaMap[kota]) kotaMap[kota] = { pesanan: 0, pcs: 0, provinsi: prov };
       kotaMap[kota].pesanan++;
-      kotaMap[kota].pcs += pcs;
+      kotaMap[kota].pcs += o.qty;
     });
 
     const byProvinsi = Object.entries(provMap)
       .map(([name, d]) => ({ name, pesanan: d.pesanan, pcs: d.pcs, topKota: Object.entries(d.kota).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>`${k} (${v})`).join(", ") }))
       .sort((a,b) => b.pesanan - a.pesanan);
-
     const byKota = Object.entries(kotaMap)
       .map(([name, d]) => ({ name, pesanan: d.pesanan, pcs: d.pcs, provinsi: d.provinsi }))
       .sort((a,b) => b.pesanan - a.pesanan);
 
-    // Highlights
     const topProv = byProvinsi[0];
     const topKota = byKota[0];
-    const jawa = byProvinsi.filter(p => p.name.includes("JAWA") || p.name.includes("DKI") || p.name.includes("BANTEN") || p.name.includes("YOGYAKARTA"));
-    const jawaPesanan = jawa.reduce((t, p) => t + p.pesanan, 0);
-    const luarJawa = byProvinsi.filter(p => !jawa.find(j => j.name === p.name));
-    const luarJawaPesanan = luarJawa.reduce((t, p) => t + p.pesanan, 0);
-    const totalProvCount = byProvinsi.length;
-
+    const jawa = byProvinsi.filter(p => /JAWA|DKI|BANTEN|YOGYA/i.test(p.name));
+    const jawaPesanan = jawa.reduce((t,p) => t + p.pesanan, 0);
+    const luarJawa = total - jawaPesanan;
     const highlights = [
-      { icon: "🏆", label: "Provinsi terbesar", value: topProv?.name, sub: `${topProv?.pesanan} pesanan · ${((topProv?.pesanan||0)/total*100).toFixed(0)}% dari total` },
+      { icon: "🏆", label: "Provinsi terbesar", value: topProv?.name, sub: `${topProv?.pesanan} pesanan · ${total ? ((topProv?.pesanan||0)/total*100).toFixed(0) : 0}% dari total` },
       { icon: "📍", label: "Kota terbesar", value: topKota?.name, sub: `${topKota?.pesanan} pesanan · ${topKota?.provinsi}` },
-      { icon: "🗺️", label: "Jangkauan", value: `${totalProvCount} provinsi`, sub: `${byKota.length} kota/kabupaten terjangkau` },
-      { icon: "☕", label: "Jawa vs Luar Jawa", value: `${((jawaPesanan/total)*100).toFixed(0)}% Jawa`, sub: `Luar Jawa ${((luarJawaPesanan/total)*100).toFixed(0)}% — ${luarJawaPesanan} pesanan` },
+      { icon: "🗺️", label: "Jangkauan", value: `${byProvinsi.length} provinsi`, sub: `${byKota.length} kota/kabupaten terjangkau` },
+      { icon: "☕", label: "Jawa vs Luar Jawa", value: `${total ? ((jawaPesanan/total)*100).toFixed(0) : 0}% Jawa`, sub: `Luar Jawa ${total ? ((luarJawa/total)*100).toFixed(0) : 0}% — ${luarJawa} pesanan` },
     ];
 
-    // Retur data per SKU
-    const returOrders = orders.filter(o => o.isRetur);
+    // Retur
+    const returOrders = (snap?.orders || []).filter(o => o.isRetur);
     const returBySku = {};
     returOrders.forEach(o => {
       const key = o.produk || o.sku || "Unknown";
@@ -5211,19 +5933,49 @@ function AreaTab({ snap }) {
     });
     const returData = Object.values(returBySku).sort((a,b) => b.qty - a.qty);
 
-    return { byProvinsi, byKota, highlights, returData };
-  }, [snap]);
+    const periods = [snap?.periodEnd, tiktokOrdersSnap?.periodEnd].filter(Boolean);
+    const periodLabel = periods.length ? periods[0] : "";
+
+    return { byProvinsi, byKota, highlights, returData, periodLabel, totalOrders: total };
+  }, [snap, tiktokOrdersSnap, channel]);
 
   const data = view === "provinsi" ? byProvinsi : byKota;
   const sorted = [...data].sort((a,b) => b[sortBy] - a[sortBy]);
   const maxVal = sorted[0]?.[sortBy] || 1;
 
+  const hasShopee = !!(snap?.orders?.length);
+  const hasTiktok = !!(tiktokOrdersSnap?.orders?.length);
+
   return (
     <div>
-      <SectionLabel>SEBARAN AREA · {snap.periodStart} → {snap.periodEnd} · {snap.orders.length} pesanan aktif</SectionLabel>
+      {/* Channel tabs */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+        {[["all","Semua Channel"], ["shopee","Shopee"], ["tiktok","TikTok Shop"]].map(([k, lbl]) => {
+          const disabled = (k === "shopee" && !hasShopee) || (k === "tiktok" && !hasTiktok);
+          return (
+            <button key={k} disabled={disabled} onClick={() => setChannel(k)}
+              style={{ fontFamily: mono, fontSize: 12, fontWeight: 700, padding: "7px 16px", borderRadius: 6,
+                cursor: disabled ? "not-allowed" : "pointer",
+                border: `1px solid ${channel===k ? C.accent : C.line}`,
+                background: channel===k ? C.accent+"1a" : "transparent",
+                color: disabled ? C.dim : channel===k ? C.accent : C.muted,
+                opacity: disabled ? 0.4 : 1 }}>
+              {lbl}
+              {k === "tiktok" && !hasTiktok && <span style={{ fontSize: 10, marginLeft: 6, color: C.dim }}>belum diimport</span>}
+            </button>
+          );
+        })}
+        {!hasTiktok && (
+          <button onClick={onImportTiktok} style={{ fontFamily: mono, fontSize: 11, padding: "7px 14px", borderRadius: 6, border: `1px solid ${C.line}`, background: "transparent", color: "#fe2c55", cursor: "pointer" }}>
+            + Import Pesanan TikTok
+          </button>
+        )}
+      </div>
 
-      {/* Retur Summary */}
-      {snap.summary && (
+      <SectionLabel>SEBARAN AREA · {channel === "all" ? "Semua Channel" : channel === "shopee" ? "Shopee" : "TikTok Shop"} · {totalOrders} pesanan</SectionLabel>
+
+      {/* Retur Summary (Shopee only) */}
+      {(channel === "all" || channel === "shopee") && snap?.summary && (
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>RETUR & PENGEMBALIAN</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10, marginBottom: 12 }}>
@@ -5726,67 +6478,203 @@ function MetaAdsView({ snap }) {
   );
 }
 
-function AllChannelView({ active, metaSnap, tiktokAdsSnap }) {
+function AllChannelView({ active, metaSnap, tiktokAdsSnap, thresholds }) {
+  const [budget, setBudget] = useState(0);
+
   const shopeeSpend  = active ? active.ads.reduce((t,a) => t+a.spend, 0) : 0;
   const shopeeGmv    = active ? active.ads.reduce((t,a) => t+a.gmv, 0) : 0;
   const shopeeConv   = active ? active.ads.reduce((t,a) => t+(a.conv||0), 0) : 0;
   const shopeeRoas   = shopeeSpend > 0 ? shopeeGmv/shopeeSpend : 0;
+  const shopeeCtr    = active ? (active.ads.reduce((t,a) => t+(a.clicks||0), 0) / Math.max(active.ads.reduce((t,a) => t+(a.impr||0), 0), 1) * 100) : 0;
+  const shopeeCvr    = active ? (shopeeConv / Math.max(active.ads.reduce((t,a) => t+(a.clicks||0), 0), 1) * 100) : 0;
   const metaSpend    = metaSnap?.summary?.totalSpend || 0;
-  const metaResults  = metaSnap?.summary?.totalResult || 0;
+  const metaGmv      = metaSnap?.summary?.totalRevenue || 0;
+  const metaConv     = metaSnap?.summary?.totalResult || 0;
   const metaRoas     = metaSnap?.summary?.blendedRoas || 0;
-  const metaImpr     = metaSnap?.summary?.totalImpr || 0;
+  const metaCtr      = metaSnap?.summary?.ctr || 0;
+  const metaCvr      = metaSnap?.summary?.cvr || 0;
   const ttAdsSpend   = tiktokAdsSnap?.summary?.totalSpend || 0;
   const ttAdsGmv     = tiktokAdsSnap?.summary?.totalGmv || 0;
   const ttAdsOrders  = tiktokAdsSnap?.summary?.totalOrders || 0;
-  const ttAdsRoi     = tiktokAdsSnap?.summary?.blendedRoi || 0;
+  const ttAdsRoas    = tiktokAdsSnap?.summary?.blendedRoi || 0;
   const totalSpend   = shopeeSpend + metaSpend + ttAdsSpend;
-  const channels     = [
-    { name: "Shopee Ads", spend: shopeeSpend, gmv: shopeeGmv, conv: shopeeConv, roas: shopeeRoas, color: C.accent },
-    ...(metaSnap ? [{ name: "Meta Ads", spend: metaSpend, gmv: 0, conv: metaResults, roas: metaRoas, color: "#1877f2" }] : []),
-    ...(tiktokAdsSnap ? [{ name: "TikTok GMV Max", spend: ttAdsSpend, gmv: ttAdsGmv, conv: ttAdsOrders, roas: ttAdsRoi, color: "#fe2c55" }] : []),
+  const totalGmv     = shopeeGmv + metaGmv + ttAdsGmv;
+
+  const channels = [
+    { name: "Shopee Ads", spend: shopeeSpend, gmv: shopeeGmv, conv: shopeeConv, roas: shopeeRoas, ctr: shopeeCtr, cvr: shopeeCvr, color: "#F97316" },
+    ...(metaSnap    ? [{ name: "Meta Ads",       spend: metaSpend,  gmv: metaGmv,   conv: metaConv,    roas: metaRoas,   ctr: metaCtr,   cvr: metaCvr,   color: "#1877f2" }] : []),
+    ...(tiktokAdsSnap ? [{ name: "TikTok GMV Max", spend: ttAdsSpend, gmv: ttAdsGmv,  conv: ttAdsOrders, roas: ttAdsRoas,  ctr: 0,         cvr: 0,         color: "#fe2c55" }] : []),
   ];
+
+  // Budget allocation: channels below threshold get reduced weight, above get boosted
+  // Score = ROAS^2 / threshold to amplify differences (high ROAS gets disproportionately more)
+  const targetRoasForAlloc = thresholds?.targetRoas || 5;
+  const allocScore = (roas) => {
+    if (roas <= 0) return 0;
+    if (roas < targetRoasForAlloc * 0.5) return 0.05; // near-zero for very low ROAS
+    if (roas < targetRoasForAlloc) return (roas / targetRoasForAlloc) * 0.5; // reduced weight below target
+    return (roas / targetRoasForAlloc); // linear above target
+  };
+  const totalAllocWeight = channels.reduce((t, c) => t + allocScore(c.roas), 0);
+  const allocBudget = budget > 0 ? budget : totalSpend;
+  const allocations = channels.map(c => ({
+    ...c,
+    allocPct: totalAllocWeight > 0 ? (allocScore(c.roas) / totalAllocWeight * 100) : (100 / channels.length),
+    allocAmount: totalAllocWeight > 0 ? (allocScore(c.roas) / totalAllocWeight * allocBudget) : (allocBudget / channels.length),
+    currentPct: totalSpend > 0 ? (c.spend / totalSpend * 100) : 0,
+  }));
+
+  // Cross-channel diagnosa
+  const crossDiagnosa = [];
+  if (channels.length > 1) {
+    const best = [...channels].sort((a,b) => b.roas - a.roas)[0];
+    const worst = [...channels].sort((a,b) => a.roas - b.roas)[0];
+    if (best.roas > worst.roas * 1.5) {
+      crossDiagnosa.push({ level: "good", tag: "SHIFT BUDGET", msg: `${best.name} ROAS ${best.roas.toFixed(2)}x vs ${worst.name} ${worst.roas.toFixed(2)}x — pertimbangkan geser budget dari ${worst.name} ke ${best.name}.` });
+    }
+    channels.forEach(ch => {
+      const allocPct = totalAllocWeight > 0 ? (allocScore(ch.roas) / totalAllocWeight * 100) : (100 / channels.length);
+      const currentPct = totalSpend > 0 ? (ch.spend / totalSpend * 100) : 0;
+      const gap = allocPct - currentPct;
+      if (gap > 15 && ch.roas > 3) crossDiagnosa.push({ level: "watch", tag: "UNDERALLOCATED", msg: `${ch.name} ROAS tinggi (${ch.roas.toFixed(2)}x) tapi hanya ${currentPct.toFixed(0)}% dari total budget — potensi GMV hilang.` });
+      if (gap < -20 && ch.roas < 4) crossDiagnosa.push({ level: "bad", tag: "OVERALLOCATED", msg: `${ch.name} mendapat ${currentPct.toFixed(0)}% budget tapi ROAS ${ch.roas.toFixed(2)}x — terlalu banyak untuk return yang didapat.` });
+    });
+    if (metaSnap && metaCtr > shopeeCtr * 1.5) crossDiagnosa.push({ level: "good", tag: "META CTR KUAT", msg: `CTR Meta ${metaCtr.toFixed(2)}% jauh lebih tinggi dari Shopee ${shopeeCtr.toFixed(2)}% — creative Meta bagus, bisa direplikasi ke channel lain.` });
+  }
 
   return (
     <div>
-      <SectionLabel>SEMUA CHANNEL · RINGKASAN SPEND</SectionLabel>
-      <div style={S.kpiGrid}>
-        <Kpi label="Total Spend Semua Channel" value={rpShort(totalSpend)} dir="cost" big accent={C.watch} />
-        <Kpi label="Shopee Ads Spend" value={rpShort(shopeeSpend)} dir="cost" accent={C.accent} />
-        {metaSnap && <Kpi label="Meta Ads Spend" value={rpShort(metaSpend)} dir="cost" accent={"#1877f2"} />}
-        <Kpi label="Shopee ROAS" value={shopeeRoas.toFixed(2)+"x"} dir="rev" accent={shopeeRoas >= 5 ? C.good : C.watch} />
-        {metaSnap && <Kpi label="Meta Blended ROAS" value={metaRoas.toFixed(2)+"x"} dir="rev" accent={metaRoas >= 3 ? C.good : C.watch} />}
-        {metaSnap && <Kpi label="Meta Impressi" value={nfmt(metaImpr)} dir="neutral" accent={C.muted} />}
-        {tiktokAdsSnap && <Kpi label="TikTok GMV Max ROI" value={ttAdsRoi.toFixed(2)+"x"} dir="rev" accent={ttAdsRoi >= 5 ? C.good : C.watch} />}
-        {tiktokAdsSnap && <Kpi label="TikTok GMV" value={rpShort(ttAdsGmv)} dir="rev" accent={"#fe2c55"} />}
+      <SectionLabel>SEMUA CHANNEL · PERBANDINGAN</SectionLabel>
+
+      {/* Comparison table */}
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 12 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: mono }}>
+          <thead>
+            <tr style={{ background: C.panel2 }}>
+              <th style={{ ...S.th, textAlign: "left", paddingLeft: 16 }}>Channel</th>
+              <th style={S.th}>Spend</th>
+              <th style={S.th}>GMV</th>
+              <th style={S.th}>ROAS</th>
+              <th style={S.th}>Konversi</th>
+              <th style={S.th}>CTR</th>
+              <th style={S.th}>% Budget</th>
+            </tr>
+          </thead>
+          <tbody>
+            {channels.map((ch, i) => {
+              const pct = totalSpend > 0 ? (ch.spend / totalSpend * 100) : 0;
+              const roasColor = ch.roas >= 7 ? C.good : ch.roas >= 4 ? C.accent : C.bad;
+              return (
+                <tr key={i} style={{ borderTop: `1px solid ${C.line}` }}>
+                  <td style={{ ...S.td, paddingLeft: 16 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: ch.color, flexShrink: 0 }} />
+                      <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700 }}>{ch.name}</span>
+                    </div>
+                  </td>
+                  <td style={{ ...S.tdR, color: C.watch }}>{rpShort(ch.spend)}</td>
+                  <td style={{ ...S.tdR, color: C.accent }}>{rpShort(ch.gmv)}</td>
+                  <td style={{ ...S.tdR, fontWeight: 700, color: roasColor }}>{ch.roas.toFixed(2)}x</td>
+                  <td style={{ ...S.tdR }}>{nfmt(ch.conv)}</td>
+                  <td style={{ ...S.tdR }}>{ch.ctr > 0 ? ch.ctr.toFixed(2) + "%" : "—"}</td>
+                  <td style={{ ...S.tdR, minWidth: 120 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ flex: 1, height: 6, background: C.panel2, borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ width: pct + "%", height: "100%", background: ch.color, borderRadius: 3 }} />
+                      </div>
+                      <span style={{ fontSize: 11, color: C.muted, minWidth: 32, textAlign: "right" }}>{pct.toFixed(0)}%</span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {/* Total row */}
+            <tr style={{ borderTop: `2px solid ${C.line}`, background: C.panel2 }}>
+              <td style={{ ...S.td, paddingLeft: 16, fontWeight: 700, fontFamily: sans }}>Total</td>
+              <td style={{ ...S.tdR, fontWeight: 700, color: C.watch }}>{rpShort(totalSpend)}</td>
+              <td style={{ ...S.tdR, fontWeight: 700, color: C.accent }}>{rpShort(totalGmv)}</td>
+              <td style={{ ...S.tdR, fontWeight: 700, color: totalSpend > 0 ? (totalGmv/totalSpend >= 5 ? C.good : C.bad) : C.muted }}>
+                {totalSpend > 0 ? (totalGmv / totalSpend).toFixed(2) + "x" : "—"}
+              </td>
+              <td style={{ ...S.tdR, fontWeight: 700 }}>{nfmt(channels.reduce((t,c)=>t+c.conv,0))}</td>
+              <td style={S.tdR}>—</td>
+              <td style={{ ...S.tdR, fontWeight: 700 }}>100%</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
-      {/* Spend allocation bar */}
-      {totalSpend > 0 && (
-        <div style={{ marginTop: 16, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px" }}>
-          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1, marginBottom: 12 }}>ALOKASI SPEND PER CHANNEL</div>
-          {channels.map((ch, i) => {
-            const pct = totalSpend ? ch.spend/totalSpend*100 : 0;
-            return (
-              <div key={i} style={{ marginBottom: 14 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                  <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 600, color: ch.color }}>{ch.name}</span>
-                  <span style={{ fontFamily: mono, fontSize: 13, color: C.ink }}>{rpShort(ch.spend)} <span style={{ color: C.muted }}>({pct.toFixed(0)}%)</span></span>
+      {/* Budget Allocation Tool */}
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "16px 18px", marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: 1 }}>REKOMENDASI ALOKASI BUDGET</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontFamily: sans, fontSize: 12, color: C.muted }}>Budget total:</span>
+            <input
+              type="number"
+              value={budget || ""}
+              onChange={e => setBudget(parseFloat(e.target.value) || 0)}
+              placeholder={rpShort(totalSpend)}
+              style={{ fontFamily: mono, fontSize: 12, padding: "5px 10px", border: `1px solid ${C.line}`, borderRadius: 6, width: 140, outline: "none", background: C.panel2 }}
+            />
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: C.dim, fontFamily: sans, marginBottom: 12 }}>
+          Rekomendasi dihitung proporsional berdasarkan ROAS tiap channel. Channel ROAS lebih tinggi dapat porsi lebih besar.
+        </div>
+        {allocations.map((ch, i) => {
+          const diff = ch.allocAmount - ch.spend;
+          const diffPct = ch.currentPct - ch.allocPct;
+          const action = Math.abs(diffPct) < 5 ? "pertahankan" : diffPct > 0 ? "kurangi" : "tambah";
+          const actionColor = action === "pertahankan" ? C.good : action === "kurangi" ? C.bad : C.accent;
+          return (
+            <div key={i} style={{ marginBottom: 14, paddingBottom: 14, borderBottom: i < allocations.length - 1 ? `1px solid ${C.line}` : "none" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: ch.color, flexShrink: 0, marginTop: 2 }} />
+                  <div>
+                    <div style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>{ch.name}</div>
+                    <div style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>ROAS {ch.roas.toFixed(2)}x · saat ini {rpShort(ch.spend)} ({ch.currentPct.toFixed(0)}%)</div>
+                  </div>
                 </div>
-                <div style={{ height: 8, background: C.panel2, borderRadius: 4, overflow: "hidden" }}>
-                  <div style={{ width: pct+"%", height: "100%", background: ch.color, borderRadius: 4 }} />
-                </div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, marginTop: 4 }}>
-                  ROAS {ch.roas.toFixed(2)}x · {ch.name === "Shopee Ads" ? `${nfmt(ch.conv)} konversi` : `${nfmt(ch.conv)} results`}
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontFamily: mono, fontSize: 14, fontWeight: 700, color: C.ink }}>{rpShort(ch.allocAmount)}</div>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: actionColor, fontWeight: 700 }}>
+                    {action === "pertahankan" ? "✓ pertahankan" : action === "kurangi" ? `↓ kurangi ${rpShort(Math.abs(diff))}` : `↑ tambah ${rpShort(Math.abs(diff))}`}
+                  </div>
                 </div>
               </div>
-            );
-          })}
-        </div>
+              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                <div style={{ flex: 1, height: 8, background: C.panel2, borderRadius: 4, overflow: "hidden", position: "relative" }}>
+                  <div style={{ position: "absolute", height: "100%", width: ch.currentPct + "%", background: ch.color, opacity: 0.3, borderRadius: 4 }} />
+                  <div style={{ position: "absolute", height: "100%", width: ch.allocPct + "%", background: ch.color, borderRadius: 4 }} />
+                </div>
+                <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, minWidth: 40 }}>{ch.allocPct.toFixed(0)}%</span>
+              </div>
+              <div style={{ fontFamily: mono, fontSize: 9, color: C.dim, marginTop: 3 }}>
+                bar biru = rekomendasi · transparan = saat ini
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Cross-channel diagnosa */}
+      {crossDiagnosa.length > 0 && (
+        <>
+          <SectionLabel>DIAGNOSA LINTAS CHANNEL</SectionLabel>
+          {crossDiagnosa.map((d, i) => (
+            <div key={i} style={{ ...S.diagItem, borderLeftColor: d.level === "bad" ? C.bad : d.level === "good" ? C.good : C.watch, marginBottom: 8 }}>
+              <span style={{ ...S.diagTag, color: d.level === "bad" ? C.bad : d.level === "good" ? C.good : C.watch }}>{d.tag}</span>
+              <span style={S.diagMsg}>{d.msg}</span>
+            </div>
+          ))}
+        </>
       )}
 
-      {!metaSnap && (
+      {!metaSnap && !tiktokAdsSnap && (
         <div style={{ ...S.invIntro, marginTop: 12 }}>
-          Import <b>Meta Ads CSV</b> via tombol + Import Data untuk melihat perbandingan lintas channel.
+          Import <b>Meta Ads CSV</b> atau <b>TikTok GMV Max</b> via tombol + Import Data untuk perbandingan lintas channel.
         </div>
       )}
     </div>
