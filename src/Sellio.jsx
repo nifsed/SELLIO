@@ -4302,10 +4302,10 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
 
   // Sub-tabs available per channel
   const subTabs = [
-    { k:"top15", lbl:"Top 15" },
-    ...((channel==="shopee"||channel==="all") && snap?.products?.length ? [{ k:"bcg_revenue", lbl:"BCG Revenue" }] : []),
-    ...(hasTiktok && snap?.products?.length ? [{ k:"bcg_pesanan", lbl:"BCG Pesanan" }] : []),
-    { k:"warna", lbl:"Warna" },
+    { k:"top15", lbl:"Top 15 Produk" },
+    ...((channel==="shopee"||channel==="all"||channel==="tiktok") && snap?.products?.length ? [{ k:"bcg_revenue", lbl:"BCG Matrix - Revenue" }] : []),
+    ...(hasTiktok && snap?.products?.length ? [{ k:"bcg_pesanan", lbl:"BCG Matrix - Pesanan" }] : []),
+    { k:"warna", lbl:"Warna Terlaris" },
   ];
 
   return (
@@ -4406,8 +4406,8 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
         </>
       )}
 
-      {/* ── BCG by Revenue (Shopee) ── */}
-      {ptab === "bcg_revenue" && hasShopee && (
+      {/* ── BCG Matrix - Revenue ── */}
+      {ptab === "bcg_revenue" && snap?.products?.length > 0 && (
         <>
           <SectionLabel>BCG MATRIX · by Revenue Share · {snap.products.length} SKU · {snap.periodStart} → {snap.periodEnd}</SectionLabel>
           <div style={S.bcgIntro}>
@@ -4459,10 +4459,10 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
         </>
       )}
 
-      {/* ── BCG by Pesanan (TikTok demand signal) ── */}
+      {/* ── BCG Matrix - Pesanan ── */}
       {ptab === "bcg_pesanan" && (
         <>
-          <SectionLabel>BCG MATRIX · by Rasio Pesanan TikTok + Revenue Shopee</SectionLabel>
+          <SectionLabel>BCG MATRIX · PESANAN - TikTok demand signal + Revenue Shopee</SectionLabel>
           <div style={S.bcgIntro}>
             Sumbu X = revenue share gabungan, sumbu Y = demand signal dari pesanan TikTok. Produk yang laku di TikTok tapi GMV Shopee rendah = Question Mark berpotensi tinggi.
           </div>
@@ -5338,7 +5338,8 @@ function PanduanModal({ onClose, onGoToOverview }) {
       bg: C.watch + "12",
       items: [
         { label: "Performa Produk Shopee", fmt: "XLSX", path: "Data → Performa Toko → Klik Produk → Performa Produk → Pilih Periode → Download Data", note: "Dipakai untuk tab Performa Produk, BCG Matrix, Inventory, dan Forecast." },
-        { label: "Pesanan Shopee", fmt: "XLSX", path: "Pesanan → Pesanan Saya → Export → Pilih Periode → Download", note: "Dipakai untuk tab Peta Distribusi." },
+        { label: "Pesanan Shopee", fmt: "XLSX", path: "Pesanan → Pesanan Saya → Export → Pilih Periode → Download", note: "Dipakai untuk tab Peta Distribusi dan Top 15 Produk." },
+        { label: "Semua Pesanan TikTok", fmt: "CSV", path: "TikTok Seller Center → Pesanan → Semua Pesanan → Export → Pilih Periode → Download CSV", note: "Dipakai untuk Peta Distribusi TikTok, Performa Produk TikTok, dan Top Warna." },
       ]
     },
     {
