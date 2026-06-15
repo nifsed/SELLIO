@@ -3392,11 +3392,30 @@ function Performance({ active, snapshots, marginFor, thresholds, saveThresholds,
   const [dir, setDir] = useState(-1);
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(null);
+  const [actionFilter, setActionFilter] = useState(null); // "scale" | "pause" | "watch" | "fixCtr" | "fixCvr" | null
+
+  const actionBuckets = useMemo(() => {
+    const targetRoas = thresholds.targetRoas || 5;
+    const scale  = active.ads.filter(a => a.roas >= targetRoas * 1.5 && a.spend > 0);
+    const pause  = active.ads.filter(a => a.roas < targetRoas * 0.5 && a.spend > 0);
+    const watch  = active.ads.filter(a => a.roas >= targetRoas * 0.5 && a.roas < targetRoas && a.spend > 0);
+    const fixCtr = active.ads.filter(a => a.ctr < thresholds.minCtr && (a.impr||0) >= thresholds.minImprForCtr);
+    const fixCvr = active.ads.filter(a => a.cvr < thresholds.minCvr && (a.clicks||0) >= thresholds.minClicksForCvr);
+    return { targetRoas, scale, pause, watch, fixCtr, fixCvr };
+  }, [active.ads, thresholds]);
+
+  // Filter aktif & q (search) jadi tidak relevan lagi kalau dataset iklan berganti
+  useEffect(() => { setActionFilter(null); setOpen(null); }, [active?.id]);
+
   const rows = useMemo(() => {
     let r = active.ads.filter((a) => a.name.toLowerCase().includes(q.toLowerCase()));
+    if (actionFilter) {
+      const names = new Set((actionBuckets[actionFilter] || []).map(a => a.name));
+      r = r.filter(a => names.has(a.name));
+    }
     r = [...r].sort((a, b) => (a[sort] < b[sort] ? 1 : -1) * dir);
     return r;
-  }, [active, sort, dir, q]);
+  }, [active, sort, dir, q, actionFilter, actionBuckets]);
   const head = (k, lbl, right) => (
     <th style={{ ...S.th, textAlign: right ? "right" : "left", cursor: "pointer" }}
       onClick={() => { if (sort === k) setDir(-dir); else { setSort(k); setDir(-1); } }}>
@@ -3668,54 +3687,63 @@ function Performance({ active, snapshots, marginFor, thresholds, saveThresholds,
       })()}
       {/* Action priority summary */}
       {active.ads.length > 0 && (() => {
-        const targetRoas = thresholds.targetRoas || 5;
-        const scaleAds  = active.ads.filter(a => a.roas >= targetRoas * 1.5 && a.spend > 0);
-        const pauseAds  = active.ads.filter(a => a.roas < targetRoas * 0.5 && a.spend > 0);
-        const watchAds  = active.ads.filter(a => a.roas >= targetRoas * 0.5 && a.roas < targetRoas && a.spend > 0);
-        const fixCtr    = active.ads.filter(a => a.ctr < thresholds.minCtr && (a.impr||0) >= thresholds.minImprForCtr);
-        const fixCvr    = active.ads.filter(a => a.cvr < thresholds.minCvr && (a.clicks||0) >= thresholds.minClicksForCvr);
-        if (!scaleAds.length && !pauseAds.length && !watchAds.length) return null;
+        const { targetRoas, scale, pause, watch, fixCtr, fixCvr } = actionBuckets;
+        if (!scale.length && !pause.length && !watch.length) return null;
+        const card = (key, cat, emoji, title, desc, extra) => {
+          const bucket = actionBuckets[key];
+          if (!bucket.length) return null;
+          const isActive = actionFilter === key;
+          return (
+            <div onClick={() => setActionFilter(isActive ? null : key)} style={{
+              background: PALETTE[cat][100],
+              border: `1px solid ${isActive ? PALETTE[cat][500] : PALETTE[cat][300]}`,
+              boxShadow: isActive ? `0 0 0 2px ${PALETTE[cat][200]}` : "none",
+              borderRadius: 8, padding: "10px 14px", cursor: "pointer", transition: "box-shadow 0.1s, border-color 0.1s"
+            }}>
+              <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE[cat][700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>{emoji} {title} ({bucket.length})</span>
+                <span style={{ fontSize: 12 }}>{isActive ? "✕" : "▸"}</span>
+              </div>
+              <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE[cat][700] }}>{desc}</div>
+              {extra}
+            </div>
+          );
+        };
         return (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 12 }}>
-            {scaleAds.length > 0 && (
-              <div style={{ background: PALETTE.success[100], border: `1px solid ${PALETTE.success[300]}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.success[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🚀 SCALE ({scaleAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.success[700] }}>ROAS ≥{(targetRoas*1.5).toFixed(1)}x — naikkan budget bertahap</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.success[700], marginTop: 4 }}>{rpShort(scaleAds.reduce((t,a)=>t+a.spend,0))} spend</div>
-              </div>
-            )}
-            {pauseAds.length > 0 && (
-              <div style={{ background: PALETTE.danger[100], border: `1px solid ${PALETTE.danger[300]}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.danger[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>⛔ PAUSE ({pauseAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.danger[700] }}>ROAS &lt;{(targetRoas*0.5).toFixed(1)}x — hentikan, review ulang</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.danger[700], marginTop: 4 }}>{rpShort(pauseAds.reduce((t,a)=>t+a.spend,0))} spend sia-sia</div>
-              </div>
-            )}
-            {watchAds.length > 0 && (
-              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>👀 PANTAU ({watchAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>ROAS di bawah target — jangan scale dulu</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.warning[700], marginTop: 4 }}>{rpShort(watchAds.reduce((t,a)=>t+a.spend,0))} spend</div>
-              </div>
-            )}
-            {fixCtr.length > 0 && (
-              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🎨 FIX CREATIVE ({fixCtr.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>CTR rendah — ganti visual/hook iklan</div>
-              </div>
-            )}
-            {fixCvr.length > 0 && (
-              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🛒 FIX HALAMAN ({fixCvr.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>CVR rendah — cek harga, foto, review produk</div>
-              </div>
-            )}
-          </div>
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 4 }}>
+              {card("scale", "success", "🚀", "SCALE", `ROAS ≥${(targetRoas*1.5).toFixed(1)}x — naikkan budget bertahap`,
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.success[700], marginTop: 4 }}>{rpShort(scale.reduce((t,a)=>t+a.spend,0))} spend</div>)}
+              {card("pause", "danger", "⛔", "PAUSE", `ROAS <${(targetRoas*0.5).toFixed(1)}x — hentikan, review ulang`,
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.danger[700], marginTop: 4 }}>{rpShort(pause.reduce((t,a)=>t+a.spend,0))} spend sia-sia</div>)}
+              {card("watch", "warning", "👀", "PANTAU", "ROAS di bawah target — jangan scale dulu",
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.warning[700], marginTop: 4 }}>{rpShort(watch.reduce((t,a)=>t+a.spend,0))} spend</div>)}
+              {card("fixCtr", "warning", "🎨", "FIX CREATIVE", "CTR rendah — ganti visual/hook iklan")}
+              {card("fixCvr", "warning", "🛒", "FIX HALAMAN", "CVR rendah — cek harga, foto, review produk")}
+            </div>
+            <div style={{ fontFamily: sans, fontSize: 10.5, color: C.dim, marginBottom: 12 }}>Klik salah satu kategori untuk filter tabel "Per Iklan" di bawah.</div>
+          </>
         );
       })()}
 
       <div style={S.perfBar}>
-        <SectionLabel inline>PER IKLAN · {active.ads.length}</SectionLabel>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <SectionLabel inline>PER IKLAN · {actionFilter ? `${rows.length} dari ${active.ads.length}` : active.ads.length}</SectionLabel>
+          {actionFilter && (() => {
+            const labels = { scale: "🚀 SCALE", pause: "⛔ PAUSE", watch: "👀 PANTAU", fixCtr: "🎨 FIX CREATIVE", fixCvr: "🛒 FIX HALAMAN" };
+            const cats = { scale: "success", pause: "danger", watch: "warning", fixCtr: "warning", fixCvr: "warning" };
+            const cat = cats[actionFilter];
+            return (
+              <button onClick={() => setActionFilter(null)} style={{
+                fontFamily: mono, fontSize: 11, fontWeight: 700, color: PALETTE[cat][700],
+                background: PALETTE[cat][100], border: `1px solid ${PALETTE[cat][300]}`,
+                borderRadius: 20, padding: "3px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6
+              }}>
+                {labels[actionFilter]} <span>✕</span>
+              </button>
+            );
+          })()}
+        </div>
         <input placeholder="cari iklan..." value={q} onChange={(e) => setQ(e.target.value)} style={S.search} />
       </div>
       <div style={S.tableWrap}>
@@ -3736,6 +3764,9 @@ function Performance({ active, snapshots, marginFor, thresholds, saveThresholds,
             </tr>
           </thead>
           <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={11} style={{ ...S.td, textAlign: "center", color: C.muted, padding: "20px 0" }}>Tidak ada iklan yang cocok dengan filter ini.</td></tr>
+            )}
             {rows.map((ad, i) => {
               const m = marginFor(ad);
               const dx = diagnose(ad, m, thresholds);
