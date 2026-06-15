@@ -335,10 +335,12 @@ function classifyBCG(products, adMap, feeRate) {
   }).sort((a, b) => b.sales - a.sales);
 }
 const QUAD = {
-  star: { label: "Star", color: "#3fb950", desc: "Share tinggi · CVR tinggi" },
-  cashcow: { label: "Cash Cow", color: "#58a6ff", desc: "Share tinggi · CVR rendah" },
-  question: { label: "Question Mark", color: "#d29922", desc: "Share rendah · CVR tinggi" },
-  dog: { label: "Dog", color: "#f85149", desc: "Share rendah · CVR rendah" },
+  // color = PALETTE[cat][500] (marker/dot). Literal values used here since PALETTE
+  // is declared later in the file and this object is evaluated at module load.
+  star: { label: "Star", cat: "success", color: "#16A34A", desc: "Share & CVR di atas median toko" },
+  cashcow: { label: "Cash Cow", cat: "info", color: "#3B82F6", desc: "Share di atas median, CVR di bawah" },
+  question: { label: "Question Mark", cat: "warning", color: "#D97706", desc: "CVR di atas median, share kecil" },
+  dog: { label: "Dog", cat: "danger", color: "#DC2626", desc: "Share & CVR di bawah median toko" },
 };
 
 /* ---------- DIO + stock-aware ad recommendation -------------------------- */
@@ -521,16 +523,30 @@ function periodDaysFromSnap(snap) {
 function diagnoseProduct(p, th) {
   const out = [];
   const q = QUAD[p.quadrant];
+  // CVR halaman (p.cvr, dari Performa Produk) vs CVR iklan (klik→konversi Shopee Ads).
+  // Tampilkan breakdown kalau ada data iklan dan dua angkanya beda cukup jauh —
+  // supaya rekomendasi mengarah ke akar masalah yang benar (listing vs iklan).
+  const adCvr = p.ad && p.ad.conv && p.ad.clicks ? (p.ad.conv / p.ad.clicks * 100) : null;
+  const cvrGap = adCvr != null && Math.abs(p.cvr - adCvr) > 1.5;
+  const cvrNote = cvrGap ? ` (CVR halaman ${p.cvr.toFixed(2)}%, CVR iklan ${adCvr.toFixed(2)}%)` : "";
+  const cvrShown = `CVR ${(p.blendedCvr||p.cvr).toFixed(2)}%${cvrNote}`;
+
   if (p.quadrant === "star") {
-    out.push({ level: "good", title: "Star  -  mesin revenue", msg: `Menyumbang ${p.share.toFixed(1)}% revenue (${rp(p.sales)}) dengan CVR ${(p.blendedCvr||p.cvr).toFixed(2)}%. Produk terpenting sekarang. Prioritas: jaga stok jangan stockout, scale paid ads (ROAS sudah layak), jadikan template foto/copy untuk SKU lain.` });
+    out.push({ level: "good", title: "Star  -  mesin revenue", msg: `Menyumbang ${p.share.toFixed(1)}% revenue (${rp(p.sales)}) dengan ${cvrShown} — keduanya di atas median toko. Produk terpenting sekarang. Prioritas: jaga stok jangan stockout, scale paid ads (ROAS sudah layak), jadikan template foto/copy untuk SKU lain.` });
     if (p.share > 25) out.push({ level: "watch", title: "Konsentrasi revenue tinggi", msg: `${p.share.toFixed(0)}% revenue dari satu produk  -  risiko sistemik kalau drop. Mulai develop SKU lain jadi Star kedua.` });
   } else if (p.quadrant === "cashcow") {
-    out.push({ level: "watch", title: "Cash Cow  -  konversi bocor", msg: `Share ${p.share.toFixed(1)}% tinggi tapi CVR ${(p.blendedCvr||p.cvr).toFixed(2)}% di bawah median. Traffic & exposure sudah ada  -  upside terbesar ada di fix konversi: harga, foto, deskripsi, review. Naikin CVR di sini = revenue naik tanpa nambah spend.` });
+    const adAdvice = (cvrGap && p.cvr > adCvr * 1.5)
+      ? ` CVR halaman-nya sendiri sudah oke (${p.cvr.toFixed(2)}%) — yang nge-drag adalah CVR iklan (${adCvr.toFixed(2)}%), jadi cek dulu targeting/creative iklan sebelum revisi listing.`
+      : ` Traffic & exposure sudah ada  -  upside terbesar ada di fix konversi: harga, foto, deskripsi, review. Naikin CVR di sini = revenue naik tanpa nambah spend.`;
+    out.push({ level: "watch", title: "Cash Cow  -  konversi bocor", msg: `Share ${p.share.toFixed(1)}% di atas median toko, tapi ${cvrShown} di bawah median.${adAdvice}` });
     if (p.bounceRate > 20) out.push({ level: "watch", title: "Bounce tinggi", msg: `${p.bounceRate.toFixed(0)}% pengunjung lihat tanpa beli. Cek 3 hal pertama yang dilihat pembeli: harga, foto utama, ongkir.` });
   } else if (p.quadrant === "question") {
-    out.push({ level: "watch", title: "Question Mark  -  bagus tapi sepi", msg: `CVR ${(p.blendedCvr||p.cvr).toFixed(2)}% bagus tapi share cuma ${p.share.toFixed(1)}%  -  produk meyakinkan yang beli, tapi kurang exposure. Kandidat kuat untuk di-push iklan: konversi sudah terbukti, tinggal kasih traffic.` });
+    out.push({ level: "watch", title: "Question Mark  -  bagus tapi sepi", msg: `${cvrShown} di atas median toko tapi share cuma ${p.share.toFixed(1)}%  -  produk meyakinkan yang beli, tapi kurang exposure. Kandidat kuat untuk di-push iklan: konversi sudah terbukti, tinggal kasih traffic.` });
   } else {
-    out.push({ level: "bad", title: "Dog  -  evaluasi", msg: `Share ${p.share.toFixed(1)}% & CVR ${(p.blendedCvr||p.cvr).toFixed(2)}% dua-duanya rendah. Jangan habiskan resource iklan di sini. Pilihan: perbaiki listing dulu (foto/harga), bundling dengan Star, atau clearance kalau stok mati.` });
+    const advice = (cvrGap && p.cvr > adCvr * 1.5)
+      ? `CVR halaman sebenarnya sudah di atas median (${p.cvr.toFixed(2)}%), tapi CVR iklan cuma ${adCvr.toFixed(2)}% — akar masalahnya di targeting/creative iklan, bukan listing. Evaluasi audience & materi iklan dulu, baru pertimbangkan ubah listing.`
+      : `Jangan habiskan resource iklan di sini. Pilihan: perbaiki listing dulu (foto/harga), bundling dengan Star, atau clearance kalau stok mati.`;
+    out.push({ level: "bad", title: "Dog  -  evaluasi", msg: `Share ${p.share.toFixed(1)}% & ${cvrShown} dua-duanya di bawah median toko. ${advice}` });
   }
   // cross-cut signals regardless of quadrant
   if (p.views > 5000 && p.ctr < th.minCtr) {
@@ -1080,7 +1096,7 @@ function parseTikTokOrdersCsv(text) {
   const topKota = Object.entries(kotaMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,count])=>({name,count}));
 
   // Color extraction from variation/product name
-  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","hitam","putih","abu","biru","merah","hijau","coklat","krem","sand","stone","light","dark","sage","rust","terracotta","teal","mint","burgundy","caramel","charcoal"];
+  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","tan","camel","mustard","ivory","denim","indigo","coral","lavender","turquoise","gold","silver","salmon","peach","wine","taupe","mocha","fuchsia","emerald","tosca","nude","lilac","army","plum","cognac","sand","stone","sage","rust","terracotta","teal","mint","burgundy","caramel","charcoal","hitam","putih","abu","biru","merah","hijau","coklat","krem","kuning","ungu","oranye","jingga","emas","perak"];
   const colorMap = {};
   skuRows.filter(r => r.status === "Selesai").forEach(r => {
     const text = ((r.productName || "") + " " + (r.variation || "")).toLowerCase();
@@ -1115,7 +1131,7 @@ function parseTikTokOrdersCsv(text) {
    ========================================================================== */
 function generateCOGSTemplate() {
   const rows = [
-    ["SELLIO — Template COGS / HPP", "", "", "", "", "", ""],
+    ["NOLKOMA — Template COGS / HPP", "", "", "", "", "", ""],
     ["Isi kolom biru (HPP Produksi, HPP Packaging, HPP Lainnya, Harga Jual). Total HPP & Gross Margin% otomatis.", "", "", "", "", "", ""],
     ["", "", "", "", "", "", ""],
     ["Nama Produk", "HPP Produksi (Rp)", "HPP Packaging (Rp)", "HPP Lainnya (Rp)", "Total HPP (auto)", "Harga Jual (Rp)", "Gross Margin %"],
@@ -1130,7 +1146,7 @@ function generateCOGSTemplate() {
   ws["!cols"] = [{ wch: 42 }, { wch: 18 }, { wch: 18 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 }];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "COGS");
-  XLSX.writeFile(wb, "sellio_cogs_template.xlsx");
+  XLSX.writeFile(wb, "nolkoma_cogs_template.xlsx");
 }
 
 function parseCOGSXlsx(buf) {
@@ -2607,10 +2623,10 @@ function parseOrderXlsx(buf) {
           </span>
           {hasAds && hasProd && <span style={S.srcFull}>✓ mode lengkap: iklan × produk</span>}
           {syncStatus && !syncStatus.ok && (
-            <span style={{ fontFamily: mono, fontSize: 11, color: C.watch, border: `1px solid ${C.watch}44`, background: C.watch+"12", padding: "3px 9px", borderRadius: 5 }}>{syncStatus.msg}</span>
+            <span style={{ fontFamily: mono, fontSize: 11, color: PALETTE.warning[700], border: `1px solid ${PALETTE.warning[300]}`, background: PALETTE.warning[100], padding: "3px 9px", borderRadius: 5 }}>{syncStatus.msg}</span>
           )}
           {syncStatus && syncStatus.ok && (
-            <span style={{ fontFamily: mono, fontSize: 11, color: C.good, border: `1px solid ${C.good}44`, background: C.good+"12", padding: "3px 9px", borderRadius: 5 }}>{syncStatus.msg}</span>
+            <span style={{ fontFamily: mono, fontSize: 11, color: PALETTE.success[700], border: `1px solid ${PALETTE.success[300]}`, background: PALETTE.success[100], padding: "3px 9px", borderRadius: 5 }}>{syncStatus.msg}</span>
           )}
         </div>
       )}
@@ -2839,7 +2855,7 @@ function EmptyState({ onImportAds, onImportProd, onDemo, demoMode }) {
     <div style={S.empty}>
       <div style={S.emptyMark}>▦</div>
       <h2 style={S.emptyTitle}>Mulai dengan import data</h2>
-      <p style={S.emptyText}>Sellio bekerja dengan file export dari marketplace kamu — Shopee, TikTok Shop, dan Meta Ads. Tidak perlu input manual. Klik <b>+ Import Data ▼</b> di kanan atas untuk mulai.</p>
+      <p style={S.emptyText}>Nolkoma bekerja dengan file export dari marketplace kamu — Shopee, TikTok Shop, dan Meta Ads. Tidak perlu input manual. Klik <b>+ Import Data ▼</b> di kanan atas untuk mulai.</p>
       {!demoMode && onDemo && (
         <button onClick={onDemo} style={{
           fontFamily: sans, fontSize: 13, fontWeight: 700, padding: "10px 22px", borderRadius: 10,
@@ -2999,10 +3015,10 @@ function Overview({ active, snapshots, marginFor, thresholds, activeProducts, sh
   };
 
   const alertColors = {
-    warn:  { bg: C.watch + "18", border: C.watch, title: C.watch, desc: C.watch + "cc" },
-    bad:   { bg: C.bad   + "12", border: C.bad,   title: C.bad,   desc: C.bad   + "cc" },
-    good:  { bg: C.good  + "12", border: C.good,  title: C.good,  desc: C.good  + "cc" },
-    info:  { bg: C.accent+ "12", border: C.accent, title: C.accent, desc: C.accent + "cc" },
+    warn:  { bg: PALETTE.warning[100], border: PALETTE.warning[300], title: PALETTE.warning[800], desc: PALETTE.warning[700] },
+    bad:   { bg: PALETTE.danger[100],  border: PALETTE.danger[300],  title: PALETTE.danger[800],  desc: PALETTE.danger[700] },
+    good:  { bg: PALETTE.success[100], border: PALETTE.success[300], title: PALETTE.success[800], desc: PALETTE.success[700] },
+    info:  { bg: PALETTE.primary[100], border: PALETTE.primary[300], title: PALETTE.primary[800], desc: PALETTE.primary[700] },
   };
 
   return (
@@ -3070,7 +3086,7 @@ function Overview({ active, snapshots, marginFor, thresholds, activeProducts, sh
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                   <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#F97316", flexShrink: 0 }} />
                   <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>Shopee</span>
-                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: PALETTE.success[100], color: PALETTE.success[700], padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
                 </div>
                 <div style={ov.chRow}><span style={ov.chLabel}>Net GMV</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(sh.netGmv || 0)}</span></div>
                 <div style={ov.chRow}><span style={ov.chLabel}>Fee platform</span><span style={{ ...ov.chVal, color: C.bad }}>-{rpShort(Math.abs(sh.totalFee || 0))}</span></div>
@@ -3085,7 +3101,7 @@ function Overview({ active, snapshots, marginFor, thresholds, activeProducts, sh
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                   <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#010101", flexShrink: 0 }} />
                   <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>TikTok Shop</span>
-                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: PALETTE.success[100], color: PALETTE.success[700], padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
                 </div>
                 <div style={ov.chRow}><span style={ov.chLabel}>Net GMV</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(tt.netGmv || 0)}</span></div>
                 <div style={ov.chRow}><span style={ov.chLabel}>Fee platform</span><span style={{ ...ov.chVal, color: C.bad }}>-{rpShort(Math.abs(tt.totalFee || 0))}</span></div>
@@ -3100,7 +3116,7 @@ function Overview({ active, snapshots, marginFor, thresholds, activeProducts, sh
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                   <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#1877f2", flexShrink: 0 }} />
                   <span style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: C.ink }}>Meta Ads</span>
-                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: C.good + "18", color: C.good, padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, background: PALETTE.success[100], color: PALETTE.success[700], padding: "2px 7px", borderRadius: 20 }}>Aktif</span>
                 </div>
                 <div style={ov.chRow}><span style={ov.chLabel}>Spend</span><span style={{ ...ov.chVal, color: C.watch }}>-{rpShort(metaSpend)}</span></div>
                 <div style={ov.chRow}><span style={ov.chLabel}>GMV attributed</span><span style={{ ...ov.chVal, color: C.accent }}>{rpShort(metaGmv)}</span></div>
@@ -3413,7 +3429,7 @@ function Performance({ active, snapshots, marginFor, thresholds, saveThresholds,
         <span style={{ fontSize: 13, flexShrink: 0, marginTop: 1 }}>ℹ️</span>
         <div>
           <b style={{ color: C.ink }}>Data 100% identik dengan file ekspor resmi {channel === "tiktokads" ? "TikTok Shop" : channel === "meta" ? "Meta Ads Manager" : "Shopee Seller Center"}.</b>{" "}
-          Sellio membaca file langsung tanpa modifikasi — angka yang tampil di sini adalah angka yang sama persis dengan yang ada di dashboard channel kamu. Jika ada perbedaan dengan laporan internal, kemungkinan bersumber dari perbedaan periode, timezone, atau metode agregasi di sisi platform.
+          Nolkoma membaca file langsung tanpa modifikasi — angka yang tampil di sini adalah angka yang sama persis dengan yang ada di dashboard channel kamu. Jika ada perbedaan dengan laporan internal, kemungkinan bersumber dari perbedaan periode, timezone, atau metode agregasi di sisi platform.
           {" "}<b style={{ color: C.ink }}>Diagnosa dan saran yang ditampilkan adalah gambaran awal berbasis data.</b>{" "}
           Untuk keputusan strategis lebih lanjut, validasi dengan metrics lain sebelum eksekusi.{" "}
           <a href="https://wa.me/6282130311844" target="_blank" rel="noreferrer"
@@ -3662,36 +3678,36 @@ function Performance({ active, snapshots, marginFor, thresholds, saveThresholds,
         return (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 12 }}>
             {scaleAds.length > 0 && (
-              <div style={{ background: C.good + "12", border: `1px solid ${C.good}44`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: C.good, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🚀 SCALE ({scaleAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: C.good }}>ROAS ≥{(targetRoas*1.5).toFixed(1)}x — naikkan budget bertahap</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: C.good, marginTop: 4 }}>{rpShort(scaleAds.reduce((t,a)=>t+a.spend,0))} spend</div>
+              <div style={{ background: PALETTE.success[100], border: `1px solid ${PALETTE.success[300]}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.success[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🚀 SCALE ({scaleAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.success[700] }}>ROAS ≥{(targetRoas*1.5).toFixed(1)}x — naikkan budget bertahap</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.success[700], marginTop: 4 }}>{rpShort(scaleAds.reduce((t,a)=>t+a.spend,0))} spend</div>
               </div>
             )}
             {pauseAds.length > 0 && (
-              <div style={{ background: C.bad + "10", border: `1px solid ${C.bad}44`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: C.bad, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>⛔ PAUSE ({pauseAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: C.bad }}>ROAS &lt;{(targetRoas*0.5).toFixed(1)}x — hentikan, review ulang</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: C.bad, marginTop: 4 }}>{rpShort(pauseAds.reduce((t,a)=>t+a.spend,0))} spend sia-sia</div>
+              <div style={{ background: PALETTE.danger[100], border: `1px solid ${PALETTE.danger[300]}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.danger[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>⛔ PAUSE ({pauseAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.danger[700] }}>ROAS &lt;{(targetRoas*0.5).toFixed(1)}x — hentikan, review ulang</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.danger[700], marginTop: 4 }}>{rpShort(pauseAds.reduce((t,a)=>t+a.spend,0))} spend sia-sia</div>
               </div>
             )}
             {watchAds.length > 0 && (
-              <div style={{ background: C.watch + "12", border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>👀 PANTAU ({watchAds.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>ROAS di bawah target — jangan scale dulu</div>
-                <div style={{ fontFamily: mono, fontSize: 11, color: C.watch, marginTop: 4 }}>{rpShort(watchAds.reduce((t,a)=>t+a.spend,0))} spend</div>
+              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>👀 PANTAU ({watchAds.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>ROAS di bawah target — jangan scale dulu</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: PALETTE.warning[700], marginTop: 4 }}>{rpShort(watchAds.reduce((t,a)=>t+a.spend,0))} spend</div>
               </div>
             )}
             {fixCtr.length > 0 && (
-              <div style={{ background: C.watch + "10", border: `1px solid ${C.watch}33`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🎨 FIX CREATIVE ({fixCtr.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>CTR rendah — ganti visual/hook iklan</div>
+              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🎨 FIX CREATIVE ({fixCtr.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>CTR rendah — ganti visual/hook iklan</div>
               </div>
             )}
             {fixCvr.length > 0 && (
-              <div style={{ background: C.watch + "10", border: `1px solid ${C.watch}33`, borderRadius: 8, padding: "10px 14px" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, color: C.watch, fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🛒 FIX HALAMAN ({fixCvr.length})</div>
-                <div style={{ fontFamily: sans, fontSize: 11, color: C.watch }}>CVR rendah — cek harga, foto, review produk</div>
+              <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, color: PALETTE.warning[700], fontWeight: 700, letterSpacing: 0.8, marginBottom: 4 }}>🛒 FIX HALAMAN ({fixCvr.length})</div>
+                <div style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700] }}>CVR rendah — cek harga, foto, review produk</div>
               </div>
             )}
           </div>
@@ -4013,12 +4029,12 @@ function Strategy({ active, marginFor, thresholds, activeProducts, cogsItems, sh
 
       {/* Missing data notice */}
       {missing.length > 0 && (
-        <div style={{ background: C.watch + "12", border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
-          <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.watch, letterSpacing: 1.5, marginBottom: 8 }}>⚠ STRATEGI BELUM LENGKAP · {missing.length} DATA BELUM DIIMPORT</div>
+        <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
+          <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: PALETTE.warning[700], letterSpacing: 1.5, marginBottom: 8 }}>⚠ STRATEGI BELUM LENGKAP · {missing.length} DATA BELUM DIIMPORT</div>
           <div style={{ fontFamily: sans, fontSize: 12, color: C.ink, marginBottom: 8 }}>Import data berikut untuk rekomendasi yang lebih tajam:</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             {missing.map((m, i) => (
-              <div key={i} style={{ fontFamily: sans, fontSize: 11, color: C.watch, background: C.watch+"18", border: `1px solid ${C.watch}44`, borderRadius: 6, padding: "4px 10px" }}>
+              <div key={i} style={{ fontFamily: sans, fontSize: 11, color: PALETTE.warning[700], background: PALETTE.warning[200], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 6, padding: "4px 10px" }}>
                 {m.icon} <b>{m.label}</b> — {m.hint}
               </div>
             ))}
@@ -4161,8 +4177,8 @@ function CogsTab({ active, cogsMap, setCogsMap, keyFor, flash, cogsItems, onImpo
       {/* Connected tabs info */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginBottom: 20 }}>
         {connectedTabs.map((t, i) => (
-          <div key={i} style={{ background: C.accent+"08", border: `1px solid ${C.accent}22`, borderLeft: `3px solid ${C.accent}`, borderRadius: 8, padding: "12px 14px" }}>
-            <div style={{ fontFamily: sans, fontSize: 12.5, fontWeight: 700, color: C.accent, marginBottom: 3 }}>→ {t.label}</div>
+          <div key={i} style={{ background: PALETTE.primary[100], border: `1px solid ${PALETTE.primary[300]}`, borderLeft: `3px solid ${PALETTE.primary[500]}`, borderRadius: 8, padding: "12px 14px" }}>
+            <div style={{ fontFamily: sans, fontSize: 12.5, fontWeight: 700, color: PALETTE.primary[700], marginBottom: 3 }}>→ {t.label}</div>
             <div style={{ fontFamily: sans, fontSize: 12, color: C.muted }}>{t.desc}</div>
           </div>
         ))}
@@ -4171,7 +4187,7 @@ function CogsTab({ active, cogsMap, setCogsMap, keyFor, flash, cogsItems, onImpo
       {/* COGS Template section */}
       <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "18px 20px", marginBottom: 20, boxShadow: "0 1px 3px rgba(0,0,0,0.05)" }}>
         <div style={{ fontFamily: sans, fontSize: 13.5, fontWeight: 700, color: C.ink, marginBottom: 6 }}>
-          Template HPP per SKU {hasCogs && <span style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, color: C.good, background: C.good+"12", border: `1px solid ${C.good}33`, padding: "2px 8px", borderRadius: 10, marginLeft: 8 }}>✓ {cogsItems.length} SKU diimport</span>}
+          Template HPP per SKU {hasCogs && <span style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, color: PALETTE.success[700], background: PALETTE.success[100], border: `1px solid ${PALETTE.success[300]}`, padding: "2px 8px", borderRadius: 10, marginLeft: 8 }}>✓ {cogsItems.length} SKU diimport</span>}
         </div>
         <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, lineHeight: 1.6, marginBottom: 14 }}>
           Download template Excel, isi kolom <b>HPP Produksi</b>, <b>HPP Packaging</b>, dan <b>Harga Jual</b> per SKU, lalu import balik. Data ini dipakai otomatis di Unit Economics, Contribution Margin, dan Simulasi L/R.
@@ -4310,7 +4326,22 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
     return [];
   }, [orderSnap, snap]);
 
-  const tiktokTop15 = useMemo(() => (tiktokOrdersSnap?.skuPerf || []).slice(0, 15), [tiktokOrdersSnap]);
+  const tiktokTop15 = useMemo(() => {
+    // skuPerf is per size-variant (one row per SKU+size). Aggregate by productName
+    // so one product doesn't occupy multiple Top 15 slots via its different sizes.
+    const map = {};
+    (tiktokOrdersSnap?.skuPerf || []).forEach(p => {
+      const key = p.productName;
+      const baseSku = (p.sku || "").replace(/-[A-Za-z0-9]+$/, "");
+      if (!map[key]) map[key] = { productName: key, qty: 0, gmv: 0, orders: 0, variants: 0, baseSku };
+      map[key].qty += p.qty || 0;
+      map[key].gmv += p.gmv || 0;
+      map[key].orders += p.orders || 0;
+      map[key].variants += 1;
+    });
+    return Object.values(map).sort((a,b) => b.qty - a.qty).slice(0, 15)
+      .map(p => ({ ...p, sku: p.variants > 1 ? `${p.baseSku} · ${p.variants} varian` : p.baseSku }));
+  }, [tiktokOrdersSnap]);
 
   const combinedTop15 = useMemo(() => {
     const map = {};
@@ -4330,12 +4361,24 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
 
   const bcgByPesanan = useMemo(() => {
     if (!snap?.products?.length) return [];
+    // Aggregate TikTok demand by BASE SKU code (strip trailing size segment, e.g.
+    // "SH-ATELIER-BG-L" -> "SH-ATELIER-BG"). Matching by code is far more robust than by
+    // product name — display names often differ across channels ("Gut Franc - X" vs "X"),
+    // while SKU codes are usually kept consistent. Aggregating (instead of overwriting)
+    // also fixes undercounting when a product has multiple size variants in skuPerf.
     const tiktokMap = {};
-    (tiktokOrdersSnap?.skuPerf || []).forEach(p => { tiktokMap[p.productName] = p; });
+    (tiktokOrdersSnap?.skuPerf || []).forEach(p => {
+      const baseCode = (p.sku || "").replace(/-[A-Za-z0-9]+$/, "");
+      if (!baseCode) return;
+      if (!tiktokMap[baseCode]) tiktokMap[baseCode] = { qty: 0, gmv: 0, orders: 0 };
+      tiktokMap[baseCode].qty += p.qty || 0;
+      tiktokMap[baseCode].gmv += p.gmv || 0;
+      tiktokMap[baseCode].orders += p.orders || 0;
+    });
     const totalOrders = tiktokOrdersSnap?.summary?.selesaiOrders || 1;
     const totalSales = snap.products.reduce((t, p) => t + (p.sales || 0), 1);
     return snap.products.map(p => {
-      const tt = tiktokMap[p.name] || null;
+      const tt = tiktokMap[p.code] || null;
       const combinedGmv = (p.sales || 0) + (tt?.gmv || 0);
       const orderShare = tt ? (tt.orders / totalOrders * 100) : 0;
       const revenueShare = combinedGmv / totalSales * 100;
@@ -4348,27 +4391,50 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
     }).sort((a, b) => b.combinedGmv - a.combinedGmv);
   }, [snap, tiktokOrdersSnap]);
 
-  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","hitam","putih","abu","biru","merah","hijau","coklat","krem","sand","stone","sage","rust","teal","mint","burgundy","caramel","charcoal"];
+  const colorWords = ["black","white","navy","beige","grey","gray","green","blue","red","brown","cream","khaki","olive","maroon","yellow","pink","purple","orange","tan","camel","mustard","ivory","denim","indigo","coral","lavender","turquoise","gold","silver","salmon","peach","wine","taupe","mocha","fuchsia","emerald","tosca","nude","lilac","army","plum","cognac","sand","stone","sage","rust","terracotta","teal","mint","burgundy","caramel","charcoal","hitam","putih","abu","biru","merah","hijau","coklat","krem","kuning","ungu","oranye","jingga","emas","perak"];
   const topColors = useMemo(() => {
     const map = {};
-    (snap?.products || []).forEach(p => {
-      const text = (p.name || "").toLowerCase();
-      colorWords.forEach(c => { if (text.includes(c)) map[c] = (map[c] || 0) + (p.qty || 0); });
-    });
-    (tiktokOrdersSnap?.topColors || []).forEach(({ color, count }) => {
-      map[color] = (map[color] || 0) + count;
-    });
+    if (channel !== "tiktok") {
+      (snap?.products || []).forEach(p => {
+        const text = (p.name || "").toLowerCase();
+        colorWords.forEach(c => { if (text.includes(c)) map[c] = (map[c] || 0) + (p.qty || 0); });
+      });
+    }
+    if (channel !== "shopee") {
+      (tiktokOrdersSnap?.topColors || []).forEach(({ color, count }) => {
+        map[color] = (map[color] || 0) + count;
+      });
+    }
     return Object.entries(map).filter(([,v]) => v > 0).sort((a,b) => b[1]-a[1]).slice(0, 10)
       .map(([color, count]) => ({ color, count }));
-  }, [snap, tiktokOrdersSnap]);
+  }, [snap, tiktokOrdersSnap, channel]);
 
-  const colorSwatch = { black:"#1a1a1a",white:"#f0f0f0",navy:"#003580",beige:"#e8d5b0",grey:"#9e9e9e",gray:"#9e9e9e",green:"#388e3c",blue:"#1565c0",red:"#c62828",brown:"#6d4c41",cream:"#fff8e1",khaki:"#c8b560",olive:"#808000",maroon:"#880000",yellow:"#f9a825",pink:"#e91e8c",purple:"#7b1fa2",orange:"#e65100",hitam:"#1a1a1a",putih:"#f0f0f0",abu:"#9e9e9e",biru:"#1565c0",merah:"#c62828",hijau:"#388e3c",coklat:"#6d4c41",krem:"#fff8e1",sand:"#c2b280",stone:"#928e85",sage:"#b2c9ad",rust:"#b7410e",teal:"#008080",mint:"#98ff98",burgundy:"#800020",caramel:"#c68642",charcoal:"#36454f" };
+  // Berapa % unit terjual yang nama produknya mengandung kata warna yang dikenali —
+  // membantu Hanif menilai apakah Warna Terlaris ini representatif atau banyak yang "kelewat".
+  const colorCoverage = useMemo(() => {
+    let total = 0, matched = 0;
+    if (channel !== "tiktok") {
+      (snap?.products || []).forEach(p => {
+        const text = (p.name || "").toLowerCase();
+        const qty = p.qty || 0;
+        total += qty;
+        if (colorWords.some(c => text.includes(c))) matched += qty;
+      });
+    }
+    if (channel !== "shopee") {
+      total += tiktokOrdersSnap?.summary?.totalQty || 0;
+      matched += (tiktokOrdersSnap?.topColors || []).reduce((t,c) => t + c.count, 0);
+    }
+    return { total, matched };
+  }, [snap, tiktokOrdersSnap, channel]);
+
+  const colorSwatch = { black:"#1a1a1a",white:"#f0f0f0",navy:"#003580",beige:"#e8d5b0",grey:"#9e9e9e",gray:"#9e9e9e",green:"#388e3c",blue:"#1565c0",red:"#c62828",brown:"#6d4c41",cream:"#fff8e1",khaki:"#c8b560",olive:"#808000",maroon:"#880000",yellow:"#f9a825",pink:"#e91e8c",purple:"#7b1fa2",orange:"#e65100",tan:"#d2b48c",camel:"#c19a6b",mustard:"#c9a227",ivory:"#f0ead6",denim:"#1560bd",indigo:"#4b0082",coral:"#ff7f50",lavender:"#c8a2c8",turquoise:"#40e0d0",gold:"#d4af37",silver:"#c0c0c0",salmon:"#fa8072",peach:"#ffcba4",wine:"#722f37",taupe:"#8b8589",mocha:"#6f4e37",fuchsia:"#c154c1",emerald:"#50c878",tosca:"#00a99d",nude:"#e3bc9a",lilac:"#c8a2c8",army:"#4b5320",plum:"#8e4585",cognac:"#834333",terracotta:"#e2725b",hitam:"#1a1a1a",putih:"#f0f0f0",abu:"#9e9e9e",biru:"#1565c0",merah:"#c62828",hijau:"#388e3c",coklat:"#6d4c41",krem:"#fff8e1",kuning:"#f9a825",ungu:"#7b1fa2",oranye:"#e65100",jingga:"#e65100",emas:"#d4af37",perak:"#c0c0c0",sand:"#c2b280",stone:"#928e85",sage:"#b2c9ad",rust:"#b7410e",teal:"#008080",mint:"#98ff98",burgundy:"#800020",caramel:"#c68642",charcoal:"#36454f" };
 
   // Sub-tabs available per channel
   const subTabs = [
     { k:"top15", lbl:"Top 15 Produk" },
     ...((channel==="shopee"||channel==="all"||channel==="tiktok") && snap?.products?.length ? [{ k:"bcg_revenue", lbl:"BCG Matrix - Revenue" }] : []),
-    ...(hasTiktok && snap?.products?.length ? [{ k:"bcg_pesanan", lbl:"BCG Matrix - Pesanan" }] : []),
+    ...(channel==="all" && hasTiktok && snap?.products?.length ? [{ k:"bcg_pesanan", lbl:"BCG Matrix - Pesanan" }] : []),
     { k:"warna", lbl:"Warna Terlaris" },
   ];
 
@@ -4483,7 +4549,7 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
             {Object.entries(QUAD).map(([k, q]) => (
               <div key={k} style={S.quadLegendItem}>
                 <span style={{ ...S.quadDot, background:q.color }} />
-                <b style={{ color:q.color }}>{q.label}</b>
+                <b style={{ color:PALETTE[q.cat][700] }}>{q.label}</b>
                 <span style={S.muted}>{counts[k]} · {q.desc}</span>
               </div>
             ))}
@@ -4508,12 +4574,15 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
                 </div>
                 {isOpen && (
                   <div style={S.skuBody}>
-                    {dx.map((d,i) => (
-                      <div key={i} style={{ ...S.skuDiag, borderLeftColor:d.level==="bad"?C.bad:d.level==="good"?C.good:C.watch }}>
-                        <div style={{ ...S.skuDiagTitle, color:d.level==="bad"?C.bad:d.level==="good"?C.good:C.watch }}>{d.title}</div>
+                    {dx.map((d,i) => {
+                      const cat = d.level === "bad" ? "danger" : d.level === "good" ? "success" : "warning";
+                      return (
+                      <div key={i} style={{ ...S.skuDiag, borderLeftColor: PALETTE[cat][500] }}>
+                        <div style={{ ...S.skuDiagTitle, color: PALETTE[cat][700] }}>{d.title}</div>
                         <div style={S.skuDiagMsg}>{d.msg}</div>
                       </div>
-                    ))}
+                      );
+                    })}
                     {ad && <CrossSignal p={p} ad={ad} thresholds={thresholds} />}
                   </div>
                 )}
@@ -4529,6 +4598,7 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
           <SectionLabel>BCG MATRIX · PESANAN - TikTok demand signal + Revenue Shopee</SectionLabel>
           <div style={S.bcgIntro}>
             Sumbu X = revenue share gabungan, sumbu Y = demand signal dari pesanan TikTok. Produk yang laku di TikTok tapi GMV Shopee rendah = Question Mark berpotensi tinggi.
+            <div style={{ marginTop:4, color:C.muted, fontSize:11 }}>View ini menggabungkan demand TikTok + revenue Shopee, jadi cuma tersedia di tab "Semua Channel".</div>
           </div>
           <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))", gap:10, marginBottom:16 }}>
             {[["star","⭐ Star","ROAS tinggi, demand tinggi",C.good],["cashcow","💰 Cash Cow","Revenue tinggi, demand TikTok rendah",C.accent],["question","❓ Question Mark","Demand TikTok tinggi, revenue belum besar","#F97316"],["dog","🐕 Dog","Rendah di keduanya",C.muted]].map(([k,lbl,desc,color]) => (
@@ -4565,6 +4635,12 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
       {ptab === "warna" && (
         <>
           <SectionLabel>WARNA TERLARIS · {channel==="all"?"Semua Channel":channel==="shopee"?"Shopee":"TikTok Shop"}</SectionLabel>
+          {colorCoverage.total > 0 && (
+            <div style={{ fontFamily:sans, fontSize:11.5, color:C.muted, marginBottom:10 }}>
+              {colorCoverage.matched.toLocaleString("id-ID")} dari {colorCoverage.total.toLocaleString("id-ID")} pcs ({(colorCoverage.matched/colorCoverage.total*100).toFixed(0)}%) terdeteksi warnanya dari nama produk.
+              {colorCoverage.matched < colorCoverage.total && " Sisanya pakai nama warna yang belum dikenali sistem — cek penamaan produk kalau perlu lebih lengkap."}
+            </div>
+          )}
           {topColors.length === 0 && <div style={S.cmEmpty}>Tidak ada data warna — nama produk tidak mengandung kata warna yang dikenali.</div>}
           <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))", gap:10 }}>
             {topColors.map((c,i) => {
@@ -4613,8 +4689,8 @@ function CrossSignal({ p, ad, thresholds }) {
   return (
     <>
       {msgs.map((x, i) => (
-        <div key={i} style={{ ...S.skuDiag, borderLeftColor: C.accent, background: C.accent + "0c" }}>
-          <div style={{ ...S.skuDiagTitle, color: C.accent }}>⇄ {x.t}</div>
+        <div key={i} style={{ ...S.skuDiag, borderLeftColor: PALETTE.primary[500], background: PALETTE.primary[100] }}>
+          <div style={{ ...S.skuDiagTitle, color: PALETTE.primary[700] }}>⇄ {x.t}</div>
           <div style={S.skuDiagMsg}>{x.m}</div>
         </div>
       ))}
@@ -4823,9 +4899,9 @@ function Forecast({ active, activeProducts, thresholds, marginFor }) {
 }
 function FcKpi({ label, value, accent }) {
   return (
-    <div style={{ ...S.kpi, ...(accent ? { background: C.panel2, borderColor: C.accent + "44" } : {}) }}>
+    <div style={{ ...S.kpi, ...(accent ? { background: PALETTE.primary[100], borderColor: PALETTE.primary[300] } : {}) }}>
       <div style={S.kpiLabel}>{label}</div>
-      <div style={{ ...S.kpiVal, ...(accent ? { color: C.accent } : {}) }}>{value}</div>
+      <div style={{ ...S.kpiVal, ...(accent ? { color: PALETTE.primary[700] } : {}) }}>{value}</div>
     </div>
   );
 }
@@ -4910,7 +4986,7 @@ function InventoryTab({ snap, active, thresholds, stockMap, setStockMap }) {
           <tbody>
             {skus.map((s) => {
               const rec = s.ad && s.dio !== null ? stockAdRec(s.dio, s.ad.roas, thresholds.targetRoas, s.quadrant, s.ad, thresholds) : null;
-              const recColor = rec ? (rec.level === "bad" ? C.bad : rec.level === "good" ? C.good : C.watch) : C.muted;
+              const recCat = rec ? (rec.level === "bad" ? "danger" : rec.level === "good" ? "success" : "warning") : null;
               return (
                 <tr key={s.code} style={S.tr}>
                   <td style={S.td}>
@@ -4941,7 +5017,7 @@ function InventoryTab({ snap, active, thresholds, stockMap, setStockMap }) {
                   {active && <td style={{ ...S.tdR }}>{s.ad ? s.ad.acos.toFixed(1) + "%" : " - "}</td>}
                   <td style={S.td}>
                     {rec
-                      ? <span style={{ ...S.pill, color: recColor, borderColor: recColor + "55", background: recColor + "12" }}>{rec.action}</span>
+                      ? <span style={{ ...S.pill, color: PALETTE[recCat][700], borderColor: PALETTE[recCat][300], background: PALETTE[recCat][100] }}>{rec.action}</span>
                       : s.stockUnits === null
                         ? <span style={S.muted}>isi stok</span>
                         : !s.ad
@@ -4980,7 +5056,7 @@ function InventoryDiagnosa({ s, thresholds, periodDays }) {
   const [open, setOpen] = useState(false);
   const rec = s.ad && s.dio !== null ? stockAdRec(s.dio, s.ad.roas, thresholds.targetRoas, s.quadrant, s.ad, thresholds) : null;
   const QUAD_L = QUAD[s.quadrant];
-  const recColor = rec ? (rec.level === "bad" ? C.bad : rec.level === "good" ? C.good : C.watch) : QUAD_L.color;
+  const recCat = rec ? (rec.level === "bad" ? "danger" : rec.level === "good" ? "success" : "warning") : QUAD_L.cat;
 
   // build full consultant-grade analysis
   const analysis = useMemo(() => {
@@ -5040,10 +5116,10 @@ function InventoryDiagnosa({ s, thresholds, periodDays }) {
   }, [s, thresholds, periodDays]);
 
   const urgency = analysis.find(p => p.type === "decision")?.level || "neutral";
-  const urgencyColor = urgency === "bad" ? C.bad : urgency === "good" ? C.good : C.watch;
+  const urgencyCat = urgency === "bad" ? "danger" : urgency === "good" ? "success" : "warning";
 
   return (
-    <div style={{ ...S.skuCard, borderLeftColor: urgencyColor, marginBottom: 10 }}>
+    <div style={{ ...S.skuCard, borderLeftColor: PALETTE[urgencyCat][500], marginBottom: 10 }}>
       <div style={S.skuHead} onClick={() => setOpen(!open)}>
         <div style={S.skuHeadL}>
           <QuadTag q={s.quadrant} />
@@ -5053,17 +5129,17 @@ function InventoryDiagnosa({ s, thresholds, periodDays }) {
           <span style={S.skuStat}>share <b>{s.share.toFixed(1)}%</b></span>
           {s.dio !== null && <span style={{ ...S.skuStat, color: s.dioInfo.color, fontWeight: 700 }}>DIO {s.dio}hr · {s.dioInfo.tag}</span>}
           {s.ad && <span style={{ ...S.skuStat, color: s.ad.roas >= thresholds.targetRoas ? C.good : C.bad }}>ROAS {s.ad.roas.toFixed(2)}</span>}
-          {rec && <span style={{ ...S.pill, color: recColor, borderColor: recColor + "44", background: recColor + "12", marginLeft: 4 }}>{rec.action}</span>}
+          {rec && <span style={{ ...S.pill, color: PALETTE[recCat][700], borderColor: PALETTE[recCat][300], background: PALETTE[recCat][100], marginLeft: 4 }}>{rec.action}</span>}
           <span style={{ color: C.muted, fontFamily: mono }}>{open ? "▾" : "▸"}</span>
         </div>
       </div>
       {open && (
         <div style={S.skuBody}>
           {analysis.map((pt, i) => {
-            const c = pt.level === "bad" ? C.bad : pt.level === "good" ? C.good : pt.level === "watch" ? C.watch : pt.type === "decision" ? urgencyColor : C.line;
+            const cat = pt.level === "bad" ? "danger" : pt.level === "good" ? "success" : pt.level === "watch" ? "warning" : pt.type === "decision" ? urgencyCat : null;
             return (
-              <div key={i} style={{ ...S.skuDiag, borderLeftColor: c, background: pt.type === "decision" ? c + "10" : "transparent", marginTop: pt.type === "decision" ? 14 : 8 }}>
-                <div style={{ ...S.skuDiagTitle, color: c }}>{pt.title}</div>
+              <div key={i} style={{ ...S.skuDiag, borderLeftColor: cat ? PALETTE[cat][500] : C.line, background: pt.type === "decision" && cat ? PALETTE[cat][100] : "transparent", marginTop: pt.type === "decision" ? 14 : 8 }}>
+                <div style={{ ...S.skuDiagTitle, color: cat ? PALETTE[cat][700] : C.ink }}>{pt.title}</div>
                 <div style={S.skuDiagMsg}>{pt.body}</div>
               </div>
             );
@@ -5378,8 +5454,9 @@ function PanduanModal({ onClose, onGoToOverview }) {
   const sections = [
     {
       title: "DATA IKLAN",
-      color: C.accent,
-      bg: C.accent + "12",
+      color: PALETTE.primary[700],
+      bg: PALETTE.primary[100],
+      marker: PALETTE.primary[500],
       items: [
         { label: "Shopee Ads", fmt: "CSV", path: "Pusat Promosi → Iklan Shopee → Semua Iklan Produk → Pilih Periode → Download Data Keseluruhan Iklan → Download", note: "Pastikan pilih 'Data Keseluruhan Iklan', bukan data per produk." },
         { label: "TikTok GMV Max", fmt: "XLSX", path: "Seller Dashboard → Pemasaran → Iklan Toko → Ekspor Data → Pilih Periode → Unduh", note: null },
@@ -5389,8 +5466,9 @@ function PanduanModal({ onClose, onGoToOverview }) {
     },
     {
       title: "DATA KEUANGAN",
-      color: C.good,
-      bg: C.good + "12",
+      color: PALETTE.success[700],
+      bg: PALETTE.success[100],
+      marker: PALETTE.success[500],
       items: [
         { label: "Penghasilan Shopee", fmt: "XLSX", path: "Keuangan → Penghasilan Saya → Pilih Periode → Export Data → Download", note: "Dipakai untuk kalkulasi fee marketplace, waterfall revenue, dan analisa retur." },
         { label: "Penghasilan TikTok", fmt: "XLSX", path: "TikTok Seller Center → Keuangan → Transaksi → Tipe: Penghasilan → Unduh → Pilih Periode → Download", note: "Pilih tipe 'Penghasilan' sebelum klik Unduh. File berisi sheet Detail pesanan dan Laporan." },
@@ -5398,8 +5476,9 @@ function PanduanModal({ onClose, onGoToOverview }) {
     },
     {
       title: "PRODUK & PESANAN",
-      color: C.watch,
-      bg: C.watch + "12",
+      color: PALETTE.warning[700],
+      bg: PALETTE.warning[100],
+      marker: PALETTE.warning[500],
       items: [
         { label: "Performa Produk Shopee", fmt: "XLSX", path: "Data → Performa Toko → Klik Produk → Performa Produk → Pilih Periode → Download Data", note: "Dipakai untuk tab Performa Produk, BCG Matrix, Inventory, dan Forecast." },
         { label: "Pesanan Shopee", fmt: "XLSX", path: "Pesanan → Pesanan Saya → Export → Pilih Periode → Download", note: "Dipakai untuk tab Peta Distribusi dan Top 15 Produk." },
@@ -5410,6 +5489,7 @@ function PanduanModal({ onClose, onGoToOverview }) {
       title: "COGS / HPP",
       color: "#8b5cf6",
       bg: "#8b5cf612",
+      marker: "#8b5cf6",
       items: [
         { label: "Template COGS", fmt: "XLSX", path: "Tab COGS / Margin → ⬇ Download Template COGS → Isi HPP Produksi, HPP Packaging, Harga Jual → Import balik via + Import COGS", note: "HPP Packaging default Rp 6.200 — sesuaikan jika berbeda. Data HPP dipakai di Unit Economics, Contribution Margin, dan Simulasi L/R." },
       ]
@@ -5438,11 +5518,11 @@ function PanduanModal({ onClose, onGoToOverview }) {
           {sections.map((sec, si) => (
             <div key={si} style={{ marginBottom: 20 }}>
               <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: sec.color, letterSpacing: 1.8, textTransform: "uppercase", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ display: "inline-block", width: 12, height: 2, background: sec.color, borderRadius: 2 }} />
+                <span style={{ display: "inline-block", width: 12, height: 2, background: sec.marker, borderRadius: 2 }} />
                 {sec.title}
               </div>
               {sec.items.map((item, ii) => (
-                <div key={ii} style={{ background: C.panel2, border: `1px solid ${C.line}`, borderLeft: `3px solid ${sec.color}`, borderRadius: "0 8px 8px 0", padding: "12px 14px", marginBottom: 8 }}>
+                <div key={ii} style={{ background: C.panel2, border: `1px solid ${C.line}`, borderLeft: `3px solid ${sec.marker}`, borderRadius: "0 8px 8px 0", padding: "12px 14px", marginBottom: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
                     <span style={{ fontFamily: mono, fontSize: 12, fontWeight: 700, color: C.ink }}>{item.label}</span>
                     <span style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: sec.color, background: sec.bg, padding: "2px 6px", borderRadius: 4, letterSpacing: 0.5 }}>{item.fmt}</span>
@@ -5462,10 +5542,10 @@ function PanduanModal({ onClose, onGoToOverview }) {
           ))}
 
           {/* Disclaimer */}
-          <div style={{ background: C.watch + "15", border: `1px solid ${C.watch}55`, borderRadius: 8, padding: "12px 14px", marginTop: 4 }}>
-            <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: C.watch, letterSpacing: 1.5, marginBottom: 6 }}>⚠ DISCLAIMER DATA</div>
+          <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "12px 14px", marginTop: 4 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, color: PALETTE.warning[700], letterSpacing: 1.5, marginBottom: 6 }}>⚠ DISCLAIMER DATA</div>
             <div style={{ fontFamily: sans, fontSize: 11, color: C.ink, lineHeight: 1.6 }}>
-              Data bersumber langsung dari file ekspor Shopee & TikTok Shop <b>tanpa modifikasi</b>. Perbedaan dengan laporan akuntansi (Accurate, Jurnal, ERP) bisa terjadi karena perbedaan metode pengakuan revenue, timing pelepasan dana, atau komponen yang dikapitalisasi berbeda. Angka di Sellio mencerminkan data aktual dari platform, bukan angka buku.
+              Data bersumber langsung dari file ekspor Shopee & TikTok Shop <b>tanpa modifikasi</b>. Perbedaan dengan laporan akuntansi (Accurate, Jurnal, ERP) bisa terjadi karena perbedaan metode pengakuan revenue, timing pelepasan dana, atau komponen yang dikapitalisasi berbeda. Angka di Nolkoma mencerminkan data aktual dari platform, bukan angka buku.
             </div>
           </div>
         </div>
@@ -5635,9 +5715,9 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
     return C.muted;
   };
   const rowBg = (type) => {
-    if (type === "subtotal") return C.accent + "0d";
-    if (type === "feetotal") return C.bad + "0d";
-    if (type === "result") return C.good + "0d";
+    if (type === "subtotal") return PALETTE.primary[100];
+    if (type === "feetotal") return PALETTE.danger[100];
+    if (type === "result") return PALETTE.success[100];
     return "transparent";
   };
 
@@ -5664,8 +5744,8 @@ function FeeTab({ shopeeSnap, tiktokSnap }) {
 
       {/* Missing channel warning */}
       {activeChannel === "combined" && (!shopeeSnap || !tiktokSnap) && (
-        <div style={{ background: C.watch+"15", border: `1px solid ${C.watch}55`, borderRadius: 8, padding: "10px 14px", marginBottom: 12, fontFamily: sans, fontSize: 13, lineHeight: 1.5 }}>
-          <b style={{ color: C.watch }}>⚠ Data belum lengkap —</b>
+        <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "10px 14px", marginBottom: 12, fontFamily: sans, fontSize: 13, lineHeight: 1.5 }}>
+          <b style={{ color: PALETTE.warning[700] }}>⚠ Data belum lengkap —</b>
           {!shopeeSnap && <span> Shopee belum diimport.</span>}
           {!tiktokSnap && <span> TikTok belum diimport.</span>}
           <span style={{ color: C.muted }}> Angka di bawah hanya dari channel yang sudah ada. Import kedua channel untuk perbandingan penuh.</span>
@@ -6191,8 +6271,8 @@ function matchCogs(cogsItems, name, sku) {
 
 function COGSEmptyPrompt({ onDownload, onImport }) {
   return (
-    <div style={{ background: C.watch+"12", border: `1px solid ${C.watch}44`, borderRadius: 8, padding: "16px 20px", marginBottom: 16 }}>
-      <div style={{ fontFamily: mono, fontSize: 11.5, fontWeight: 700, color: C.watch, marginBottom: 8 }}>⚠ Data COGS belum diimport</div>
+    <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 8, padding: "16px 20px", marginBottom: 16 }}>
+      <div style={{ fontFamily: mono, fontSize: 11.5, fontWeight: 700, color: PALETTE.warning[700], marginBottom: 8 }}>⚠ Data COGS belum diimport</div>
       <div style={{ fontFamily: sans, fontSize: 13, color: C.ink, marginBottom: 12, lineHeight: 1.6 }}>
         Tab ini butuh data HPP per SKU. Download template, isi HPP produksi + packaging per SKU, lalu import balik.
       </div>
@@ -6368,7 +6448,7 @@ function ContribMarginTab({ active, activeProducts, cogsItems, shopeeSnap, tikto
           </tr></thead>
           <tbody>
             {rows.map((r, i) => (
-              <tr key={i} style={{ ...S.tr, background: r.cm < 0 ? C.bad+"08" : "transparent" }}>
+              <tr key={i} style={{ ...S.tr, background: r.cm < 0 ? PALETTE.danger[100] : "transparent" }}>
                 <td style={S.td}>
                   <div style={S.adName}>{r.name}</div>
                   {!r.hasCogs && hasCogs && <div style={{ fontFamily: mono, fontSize: 10, color: C.watch }}>⚠ SKU tidak match</div>}
@@ -6464,8 +6544,8 @@ function MetaAdsView({ snap }) {
       </div>
 
       {/* Attribution note */}
-      <div style={{ background: C.watch+"10", border: `1px solid ${C.watch}33`, borderRadius: 7, padding: "10px 14px", marginTop: 10, fontFamily: sans, fontSize: 12.5, color: C.ink, lineHeight: 1.6 }}>
-        <b style={{ color: C.watch }}>Penting — beda metodologi ROAS:</b> ROAS Meta pakai atribusi 7-day click / 1-day view.
+      <div style={{ background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`, borderRadius: 7, padding: "10px 14px", marginTop: 10, fontFamily: sans, fontSize: 12.5, color: C.ink, lineHeight: 1.6 }}>
+        <b style={{ color: PALETTE.warning[700] }}>Penting — beda metodologi ROAS:</b> ROAS Meta pakai atribusi 7-day click / 1-day view.
         ROAS Shopee pakai last-click dalam platform. Jangan compare langsung — gunakan total spend + total revenue aktual dari income file sebagai basis perbandingan efisiensi channel.
       </div>
 
@@ -7218,14 +7298,14 @@ function PnLTab({ active, shopeeSnap, tiktokSnap, metaSnap, tiktokAdsSnap, cogsI
   );
 
   const AutoBadge = () => (
-    <span style={{ fontFamily: sans, fontSize: 10, fontWeight: 700, color: C.good,
-      background: C.good+"15", border: `1px solid ${C.good}33`,
+    <span style={{ fontFamily: sans, fontSize: 10, fontWeight: 700, color: PALETTE.success[700],
+      background: PALETTE.success[100], border: `1px solid ${PALETTE.success[300]}`,
       padding: "1px 6px", borderRadius: 10, marginLeft: 6 }}>auto</span>
   );
 
   const ManualBadge = () => (
-    <span style={{ fontFamily: sans, fontSize: 10, fontWeight: 700, color: C.watch,
-      background: C.watch+"15", border: `1px solid ${C.watch}33`,
+    <span style={{ fontFamily: sans, fontSize: 10, fontWeight: 700, color: PALETTE.warning[700],
+      background: PALETTE.warning[100], border: `1px solid ${PALETTE.warning[300]}`,
       padding: "1px 6px", borderRadius: 10, marginLeft: 6 }}>manual</span>
   );
 
@@ -7257,9 +7337,9 @@ function PnLTab({ active, shopeeSnap, tiktokSnap, metaSnap, tiktokAdsSnap, cogsI
           cogsItems.length > 0 ? { label: `COGS (${cogsItems.length} SKU)`, ok: true } : { label: "COGS belum diisi", ok: false },
         ].filter(Boolean).map((s, i) => (
           <span key={i} style={{ fontFamily: sans, fontSize: 11, fontWeight: 600,
-            color: s.ok ? C.good : C.watch,
-            background: (s.ok ? C.good : C.watch)+"12",
-            border: `1px solid ${(s.ok ? C.good : C.watch)}33`,
+            color: s.ok ? PALETTE.success[700] : PALETTE.warning[700],
+            background: s.ok ? PALETTE.success[100] : PALETTE.warning[100],
+            border: `1px solid ${s.ok ? PALETTE.success[300] : PALETTE.warning[300]}`,
             padding: "2px 8px", borderRadius: 10 }}>
             {s.ok ? "✓" : "⚠"} {s.label}
           </span>
@@ -7289,7 +7369,7 @@ function PnLTab({ active, shopeeSnap, tiktokSnap, metaSnap, tiktokAdsSnap, cogsI
                 <span style={{ fontFamily: sans, fontSize: 11, color: C.watch, marginLeft: 8 }}>⚠ COGS belum diisi</span>
               </div>
               <button onClick={onGoToCogs} style={{ fontFamily: sans, fontSize: 12, fontWeight: 700,
-                color: C.accent, background: C.accent+"10", border: `1px solid ${C.accent}33`,
+                color: PALETTE.primary[700], background: PALETTE.primary[100], border: `1px solid ${PALETTE.primary[300]}`,
                 padding: "5px 12px", borderRadius: 6, cursor: "pointer" }}>
                 Isi COGS →
               </button>
@@ -7364,8 +7444,9 @@ function PnLTab({ active, shopeeSnap, tiktokSnap, metaSnap, tiktokAdsSnap, cogsI
 
 function QuadTag({ q }) {
   const ql = QUAD[q] || QUAD.dog;
+  const p = PALETTE[ql.cat];
   return (
-    <span style={{ ...S.skuQuad, color: ql.color, borderColor: ql.color + "55", background: ql.color + "15" }}>
+    <span style={{ ...S.skuQuad, color: p[700], borderColor: p[300], background: p[100] }}>
       {ql.label}
     </span>
   );
@@ -7498,18 +7579,44 @@ function Kpi({ label, value, sub, dir, big, accent }) {
 }
 
 /* ---------- Theme --------------------------------------------------------- */
+// Shade-scale palette — used for "designed" status surfaces (alerts, badges,
+// KPI highlights, diagnosis boxes, BCG quadrant tags, trend indicators).
+// Convention: [100] = background tint, [300] = border, [500] = icon/marker,
+// [700]/[800] = text/title on a [100] background.
+const PALETTE = {
+  primary: {
+    100: "#EEF2FF", 200: "#E0E7FF", 300: "#C7D2FE", 400: "#A5B4FC",
+    500: "#818CF8", 600: "#6366F1", 700: "#4F46E5", 800: "#4338CA", 900: "#3730A3",
+  },
+  success: {
+    100: "#F0FDF4", 200: "#DCFCE7", 300: "#BBF7D0", 400: "#4ADE80",
+    500: "#16A34A", 600: "#15803D", 700: "#166534", 800: "#14532D", 900: "#052E16",
+  },
+  warning: {
+    100: "#FFFBEB", 200: "#FEF3C7", 300: "#FDE68A", 400: "#FBBF24",
+    500: "#D97706", 600: "#B45309", 700: "#92400E", 800: "#78350F", 900: "#451A03",
+  },
+  danger: {
+    100: "#FEF2F2", 200: "#FEE2E2", 300: "#FECACA", 400: "#F87171",
+    500: "#DC2626", 600: "#B91C1C", 700: "#991B1B", 800: "#7F1D1D", 900: "#450A0A",
+  },
+  info: {
+    100: "#EFF6FF", 200: "#DBEAFE", 300: "#BFDBFE", 400: "#60A5FA",
+    500: "#3B82F6", 600: "#2563EB", 700: "#1D4ED8", 800: "#1E40AF", 900: "#1E3A8A",
+  },
+};
 const C = {
   bg:     "#F8F8FC",   // page background — Nolkoma light indigo tint
   panel:  "#ffffff",   // card surface
-  panel2: "#EEF2FF",   // secondary surface — indigo xlight
+  panel2: "#EEF2FF",   // secondary surface — indigo xlight (= PALETTE.primary[100])
   line:   "#E0E4F4",   // borders — indigo tint
   ink:    "#0F172A",   // primary text — deep navy
   muted:  "#475569",   // secondary text
   dim:    "#94A3B8",   // tertiary / placeholder
-  good:   "#16a34a",   // green
-  bad:    "#dc2626",   // red
-  watch:  "#d97706",   // amber
-  accent: "#818CF8",   // Nolkoma indigo — primary action
+  good:   "#16a34a",   // green (= PALETTE.success[500])
+  bad:    "#dc2626",   // red (= PALETTE.danger[500])
+  watch:  "#d97706",   // amber (= PALETTE.warning[500])
+  accent: "#818CF8",   // Nolkoma indigo — primary action (= PALETTE.primary[500])
 };
 const mono = "'Plus Jakarta Sans','SF Mono','JetBrains Mono',ui-monospace,monospace";
 const sans = "'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif";
@@ -7558,7 +7665,7 @@ const S = {
   srcStrip: { display: "flex", gap: 12, alignItems: "center", padding: "8px 28px", borderBottom: `1px solid ${C.line}`, background: C.panel2, flexWrap: "wrap" },
   srcChip: { display: "inline-flex", alignItems: "center", gap: 6, fontFamily: sans, fontSize: 11.5, color: C.muted, fontWeight: 500 },
   srcDot: { width: 7, height: 7, borderRadius: 7 },
-  srcFull: { fontFamily: sans, fontSize: 11, fontWeight: 600, color: C.good, border: `1px solid ${C.good}44`, background: C.good + "0f", padding: "3px 9px", borderRadius: 20 },
+  srcFull: { fontFamily: sans, fontSize: 11, fontWeight: 600, color: PALETTE.success[700], border: `1px solid ${PALETTE.success[300]}`, background: PALETTE.success[100], padding: "3px 9px", borderRadius: 20 },
 
   // ── Empty states ──
   emptyCards: { display: "flex", gap: 14, justifyContent: "center", flexWrap: "wrap", marginTop: 24 },
@@ -7568,7 +7675,7 @@ const S = {
 
   // ── BCG / Product ──
   bcgIntro: { fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16, maxWidth: 760 },
-  invIntro: { fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16, maxWidth: 800, borderLeft: `3px solid ${C.accent}33`, paddingLeft: 14, background: C.accent + "05", borderRadius: "0 6px 6px 0", padding: "10px 14px" },
+  invIntro: { fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16, maxWidth: 800, borderLeft: `3px solid ${PALETTE.primary[500]}`, paddingLeft: 14, background: PALETTE.primary[100], borderRadius: "0 6px 6px 0", padding: "10px 14px" },
   scatterWrap: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" },
   quadLegend: { display: "flex", gap: 18, flexWrap: "wrap", marginTop: 12 },
   quadLegendItem: { display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12.5 },
@@ -7623,7 +7730,7 @@ const S = {
   // ── KPI cards ──
   kpiGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(170px,1fr))", gap: 12 },
   kpi: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "16px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.05)" },
-  kpiBig: { borderColor: C.accent + "33", background: C.accent + "04" },
+  kpiBig: { borderColor: PALETTE.primary[300], background: PALETTE.primary[100] },
   kpiLabel: { fontFamily: sans, fontSize: 11, fontWeight: 600, color: C.muted, letterSpacing: 0.5, marginBottom: 8, textTransform: "uppercase" },
   kpiVal: { fontFamily: sans, fontSize: 18, fontWeight: 800, color: C.ink },
   kpiSub: { fontFamily: sans, fontSize: 11, marginTop: 5, color: C.muted },
@@ -7631,7 +7738,7 @@ const S = {
   // ── CM cards ──
   cmRow: { display: "flex", gap: 12, flexWrap: "wrap", alignItems: "stretch" },
   cmCard: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "16px 18px", minWidth: 180, flex: 1, boxShadow: "0 1px 3px rgba(0,0,0,0.05)" },
-  cmCardFinal: { background: C.accent + "06", borderColor: C.accent + "33" },
+  cmCardFinal: { background: PALETTE.primary[100], borderColor: PALETTE.primary[300] },
   cmLabel: { fontFamily: sans, fontSize: 11, fontWeight: 600, color: C.muted, letterSpacing: 0.3, marginBottom: 8 },
   cmVal: { fontFamily: sans, fontSize: 20, fontWeight: 800, color: C.ink },
   cmEmpty: { background: C.panel2, border: `1px dashed ${C.line}`, borderRadius: 10, padding: "16px 18px", color: C.muted, fontSize: 13, width: "100%" },
