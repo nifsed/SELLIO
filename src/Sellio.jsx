@@ -1650,14 +1650,14 @@ function WelcomeScreen({ onStart, onDemo, lynkMonthly, lynkLifetime }) {
         </p>
         <div style={W.ctaRow}>
           <button style={W.btnCta} onClick={onStart}>
-            Coba Gratis 2 Hari →
+            Coba Gratis 7 Hari →
           </button>
           <button style={{ ...W.btnCtaOutline, borderColor: "#818CF8", color: "#818CF8", fontWeight: 700 }} onClick={onDemo}>
             👀 Lihat Demo Dashboard
           </button>
           <button style={W.btnCtaOutline} onClick={() => { const el = document.getElementById("nolkoma-pricing"); if (el) el.scrollIntoView({ behavior: "smooth" }); }}>Lihat Pricing</button>
         </div>
-        <p style={W.trialNote}>✓ Gratis 2 hari · ✓ Tanpa kartu kredit · ✓ Semua fitur terbuka · ✓ Demo tanpa daftar</p>
+        <p style={W.trialNote}>✓ Gratis 7 hari, dihitung dari upload data pertama · ✓ Tanpa kartu kredit · ✓ Semua fitur terbuka · ✓ Demo tanpa daftar</p>
       </div>
 
       {/* Divider */}
@@ -1715,7 +1715,7 @@ function WelcomeScreen({ onStart, onDemo, lynkMonthly, lynkLifetime }) {
           <div style={W.pricingCard}>
             <div style={W.pricingLabel}>Trial</div>
             <div style={W.pricingPrice}>Gratis</div>
-            <div style={W.pricingSub}>2 hari penuh</div>
+            <div style={W.pricingSub}>7 hari penuh, mulai dari upload data pertama</div>
             <ul style={W.pricingFeatures}>
               {["Semua fitur Pro terbuka","Semua channel (Shopee, TikTok, Meta)","BCG Matrix & Unit Economics","Inventory Decision Engine"].map((f, i) => (
                 <li key={i} style={W.pricingFeatureItem}><span style={{ color: "#818CF8", flexShrink: 0 }}>✓</span>{f}</li>
@@ -1762,7 +1762,7 @@ function WelcomeScreen({ onStart, onDemo, lynkMonthly, lynkLifetime }) {
           Siap lihat data kamu yang sebenarnya?
         </h2>
         <p style={{ fontSize: 15, color: "#c7d2fe", marginBottom: 28 }}>
-          2 hari gratis. Tidak perlu kartu kredit. Setup 5 menit.
+          7 hari gratis sejak upload data pertama. Tidak perlu kartu kredit. Setup 5 menit.
         </p>
         <button style={{ ...W.btnCta, background: "#fff", color: "#818CF8", fontSize: 16, padding: "15px 36px" }} onClick={onStart}>
           Mulai Gratis Sekarang →
@@ -1809,7 +1809,7 @@ export default function Nolkoma() {
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [showWelcome, setShowWelcome] = useState(false); // true = first-time visitor
   const [demoMode, setDemoMode] = useState(false);
-  const TRIAL_DAYS = 2;
+  const TRIAL_DAYS = 7; // dihitung dari upload data PERTAMA, bukan dari signup — lihat ensureTrialStarted()
   const LYNK_MONTHLY = "https://lynk.id/hanif.mhu/jpy8nqwvz5oe";
   const LYNK_LIFETIME = "https://lynk.id/hanif.mhu/x7oqr60p2ydd";
   const [industry, setIndustry] = useState("fashion");
@@ -1877,11 +1877,16 @@ export default function Nolkoma() {
           const result = validateKey(licKey.value);
           if (result.valid) { setLicenseStatus("pro"); return; }
         }
-        // Check/init trial
+        // Check whether user has dismissed welcome screen before (entered dashboard at least once)
+        const seenWelcome = await idbGet("license", "seenWelcome");
+        // Check/init trial — trialStart is only set on FIRST DATA UPLOAD (see ensureTrialStarted()),
+        // not on signup/welcome-dismiss. This way the trial clock doesn't burn while the user is
+        // still figuring out where to export their Shopee/TikTok files.
         let trialRec = await idbGet("license", "trialStart");
         if (!trialRec) {
-          // First-time visitor — show welcome screen, trial not started yet
-          setShowWelcome(true);
+          // Trial not started yet — either brand-new visitor, or returning visitor who hasn't
+          // uploaded anything. Either way: no countdown pressure, just let them in.
+          setShowWelcome(!seenWelcome);
           setLicenseStatus("trial");
           setTrialDaysLeft(TRIAL_DAYS);
           return;
@@ -1892,10 +1897,9 @@ export default function Nolkoma() {
         if (daysLeft > 0) {
           setLicenseStatus("trial");
           setTrialDaysLeft(daysLeft);
-          setShowWelcome(true); // show welcome even for returning trial users
         } else {
           setLicenseStatus("expired");
-          setShowWelcome(true); // show welcome for expired users too
+          setShowUpgradeModal(true);
         }
       } catch (e) {
         setLicenseStatus("trial");
@@ -2011,6 +2015,7 @@ export default function Nolkoma() {
   async function handleAdFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     const text = await f.text();
     try {
       const parsed = parseShopee(text);
@@ -2037,6 +2042,7 @@ export default function Nolkoma() {
   async function handleProdFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseProductXlsx(buf);
@@ -2068,6 +2074,7 @@ export default function Nolkoma() {
   async function handleTikTokAdsFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseTikTokAdsXlsx(buf);
@@ -2088,6 +2095,7 @@ export default function Nolkoma() {
   async function handleTikTokCampaignFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseTikTokCampaignXlsx(buf);
@@ -2105,6 +2113,7 @@ export default function Nolkoma() {
   async function handleTikTokOrdersFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const text = await f.text();
       const parsed = parseTikTokOrdersCsv(text);
@@ -2123,6 +2132,7 @@ export default function Nolkoma() {
   async function handleMetaFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const text = await f.text();
       const parsed = parseMetaAdsCsv(text);
@@ -2274,6 +2284,7 @@ function parseOrderXlsx(buf) {
   async function handleOrderFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseOrderXlsx(buf);
@@ -2294,6 +2305,7 @@ function parseOrderXlsx(buf) {
   async function handleTikTokFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseTikTokIncomeXlsx(buf);
@@ -2314,6 +2326,7 @@ function parseOrderXlsx(buf) {
   async function handleIncomeFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+    await ensureTrialStarted();
     try {
       const buf = await f.arrayBuffer();
       const parsed = parseIncomeXlsx(buf);
@@ -2398,18 +2411,30 @@ function parseOrderXlsx(buf) {
   const hasProd = !!activeProducts;
 
   async function startTrial() {
-    const trialRec = await idbGet("license", "trialStart");
-    if (!trialRec) {
-      // First time — init trial
-      const fp = getFingerprint();
-      await idbPut("license", { key: "trialStart", value: Date.now(), fingerprint: fp });
-      setTrialDaysLeft(TRIAL_DAYS);
-    }
+    // Dulu fungsi ini juga men-set trialStart (mulai jam trial). Sekarang trial baru mulai
+    // dihitung saat upload data pertama — lihat ensureTrialStarted(), dipanggil dari tiap
+    // handler import file. Di sini cukup tandai welcome screen sudah dilihat agar tidak
+    // muncul lagi tiap kali user buka aplikasi.
+    await idbPut("license", { key: "seenWelcome", value: true });
     setShowWelcome(false);
     // If expired, show upgrade modal after entering dashboard
     if (licenseStatus === "expired") {
       setTimeout(() => setShowUpgradeModal(true), 300);
     }
+  }
+
+  // Mulai jam trial 7 hari pada upload data PERTAMA (file iklan, produk, income, TikTok, dst).
+  // Dipanggil di awal setiap handler import — no-op kalau trial sudah pernah dimulai atau user
+  // sudah Pro. COGS template sengaja TIDAK memicu ini karena bukan "data jualan" yang
+  // menandakan keterlibatan aktif dengan dashboard.
+  async function ensureTrialStarted() {
+    if (licenseStatus === "pro") return;
+    const trialRec = await idbGet("license", "trialStart");
+    if (trialRec) return;
+    const fp = getFingerprint();
+    await idbPut("license", { key: "trialStart", value: Date.now(), fingerprint: fp });
+    setTrialDaysLeft(TRIAL_DAYS);
+    setLicenseStatus("trial");
   }
 
   // Demo mode — loads pre-built sample data into state (not IndexedDB) so
@@ -2719,7 +2744,7 @@ function parseOrderXlsx(buf) {
             <div style={{ fontSize: 40 }}>🔒</div>
             <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 700, color: C.ink }}>Tab ini terkunci</div>
             <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, textAlign: "center", maxWidth: 320, lineHeight: 1.6 }}>
-              Trial 2 hari sudah selesai. Upgrade ke Nolkoma Pro untuk akses semua tab, diagnosa penuh, dan export PDF.
+              Trial 7 hari sudah selesai. Upgrade ke Nolkoma Pro untuk akses semua tab, diagnosa penuh, dan export PDF.
             </div>
             <button onClick={() => setShowUpgradeModal(true)}
               style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, color: "#fff", background: C.accent, border: "none", borderRadius: 8, padding: "11px 24px", cursor: "pointer" }}>
@@ -4321,6 +4346,7 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
   const [ptab, setPtab] = useState("top15");
   const [channel, setChannel] = useState("shopee");
   const [openCode, setOpenCode] = useState(null);
+  const [bcgFilter, setBcgFilter] = useState(null);
 
   const hasShopee = !!(snap?.products?.length || orderSnap?.orders?.length);
   const hasTiktok = !!(tiktokOrdersSnap?.skuPerf?.length);
@@ -4478,7 +4504,7 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
           const active = channel === k;
           const colors = { shopee:"#F97316", tiktok:"#fe2c55", all:C.accent };
           return (
-            <button key={k} disabled={disabled} onClick={()=>{ setChannel(k); setPtab("top15"); }}
+            <button key={k} disabled={disabled} onClick={()=>{ setChannel(k); setPtab("top15"); setBcgFilter(null); }}
               style={{ fontFamily:sans, fontSize:12, fontWeight:700, padding:"10px 18px",
                 cursor:disabled?"not-allowed":"pointer", border:"none", borderBottom:`2px solid ${active?colors[k]:"transparent"}`,
                 background:"transparent", color:disabled?C.dim:active?colors[k]:C.muted,
@@ -4498,7 +4524,7 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
       {/* ── SUB TABS — level 2 ── */}
       <div style={{ display:"flex", gap:4, padding:"10px 0 14px", flexWrap:"wrap" }}>
         {subTabs.map(({ k, lbl }) => (
-          <button key={k} onClick={()=>setPtab(k)} style={{
+          <button key={k} onClick={()=>{ setPtab(k); setBcgFilter(null); }} style={{
             fontFamily:mono, fontSize:10, fontWeight:700, padding:"5px 12px", borderRadius:20,
             cursor:"pointer", border:`1px solid ${ptab===k?C.accent:C.line}`,
             background:ptab===k?C.accent:C.panel2,
@@ -4568,7 +4594,9 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
       )}
 
       {/* ── BCG Matrix - Revenue ── */}
-      {ptab === "bcg_revenue" && snap?.products?.length > 0 && (
+      {ptab === "bcg_revenue" && snap?.products?.length > 0 && (() => {
+        const filteredClassified = bcgFilter ? classified.filter(p => p.quadrant === bcgFilter) : classified;
+        return (
         <>
           <SectionLabel>BCG MATRIX · by Revenue Share · {snap.products.length} SKU · {snap.periodStart} → {snap.periodEnd}</SectionLabel>
           <div style={S.bcgIntro}>
@@ -4585,8 +4613,35 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
               </div>
             ))}
           </div>
-          <SectionLabel>DIAGNOSA & SARAN PER SKU</SectionLabel>
-          {classified.map((p) => {
+
+          {/* Filter pills */}
+          <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:12, marginTop:4 }}>
+            <span style={{ fontFamily:mono, fontSize:10, color:C.muted, fontWeight:700, letterSpacing:1 }}>FILTER:</span>
+            {[null, "star","cashcow","question","dog"].map(k => {
+              const q = k ? QUAD[k] : null;
+              const isActive = bcgFilter === k;
+              const count = k ? counts[k] : classified.length;
+              const label = k ? q.label : "Semua";
+              const cat = k ? q.cat : null;
+              return (
+                <button key={k||"all"} onClick={() => { setBcgFilter(k); setOpenCode(null); }} style={{
+                  fontFamily: mono, fontSize: 11, fontWeight: 700,
+                  color: isActive ? (cat ? PALETTE[cat][700] : C.ink) : C.muted,
+                  background: isActive ? (cat ? PALETTE[cat][100] : C.panel2) : "transparent",
+                  border: `1px solid ${isActive ? (cat ? PALETTE[cat][300] : C.line) : C.line}`,
+                  borderRadius: 20, padding: "4px 12px", cursor: "pointer", transition: "all 0.1s"
+                }}>
+                  {label} ({count})
+                </button>
+              );
+            })}
+          </div>
+
+          <SectionLabel>DIAGNOSA & SARAN PER SKU{bcgFilter ? ` · ${QUAD[bcgFilter].label.toUpperCase()} (${filteredClassified.length})` : ` · ${classified.length} SKU`}</SectionLabel>
+          {filteredClassified.length === 0 && (
+            <div style={{ fontFamily:sans, fontSize:13, color:C.muted, padding:"16px 0" }}>Tidak ada SKU di kategori ini.</div>
+          )}
+          {filteredClassified.map((p) => {
             const q = QUAD[p.quadrant];
             const dx = diagnoseProduct(p, thresholds);
             const isOpen = openCode === p.code;
@@ -4621,7 +4676,8 @@ function ProductTab({ snap, tiktokOrdersSnap, orderSnap, thresholds, active, fee
             );
           })}
         </>
-      )}
+        );
+      })()}
 
       {/* ── BCG Matrix - Pesanan ── */}
       {ptab === "bcg_pesanan" && (
@@ -5404,7 +5460,7 @@ function UpgradeModal({ onActivate, lynkMonthly, lynkLifetime, onClose }) {
         {/* Header */}
         <div style={{ textAlign: "center", marginBottom: 24 }}>
           <div style={{ width: 52, height: 52, background: "#EEF2FF", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", fontSize: 24 }}>🔒</div>
-          <div style={{ fontFamily: sans, fontSize: 20, fontWeight: 800, color: C.ink, marginBottom: 8 }}>Trial 2 hari sudah selesai</div>
+          <div style={{ fontFamily: sans, fontSize: 20, fontWeight: 800, color: C.ink, marginBottom: 8 }}>Trial 7 hari sudah selesai</div>
           <div style={{ fontFamily: sans, fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
             Kamu sudah lihat insight dari data bulan ini.<br/>Upgrade untuk lanjut akses bulan depan dan seterusnya.
           </div>
